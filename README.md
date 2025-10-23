@@ -118,3 +118,21 @@ For example:
 
 All environment configurations and training configurations can be modified in the `dfjspt_params.py` file. 
 
+## Citation
+
+If you use this code or find our work helpful, please cite the following paper:
+
+> Wang, W., Zhang, Y., Wang, Y., Pan, G., & Feng, Y. (2025). Hierarchical multi-agent deep reinforcement learning for dynamic flexible job-shop scheduling with transportation. International Journal of Production Research, 1-28.
+
+```bibtex
+@article{wang2025hierarchical,
+  title={Hierarchical multi-agent deep reinforcement learning for dynamic flexible job-shop scheduling with transportation},
+  author={Wang, Wenda and Zhang, Yi and Wang, Yong and Pan, Ge and Feng, Yiping},
+  journal={International Journal of Production Research},
+  pages={1--28},
+  year={2025},
+  publisher={Taylor \& Francis}
+}
+```
+
+

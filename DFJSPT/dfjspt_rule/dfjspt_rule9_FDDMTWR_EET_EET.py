@@ -167,8 +167,9 @@ def rule9_a_makespan(
             total_reward += reward["agent0"]
 
     make_span = env.final_makespan
+    total_tardiness = env.get_total_tardiness()
 
-    return make_span
+    return make_span, total_tardiness
 
 
 if __name__ == '__main__':

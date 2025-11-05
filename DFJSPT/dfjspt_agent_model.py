@@ -1,4 +1,4 @@
-from gymnasium.spaces import Dict
+from gymnasium.spaces import Dict, Box
 from ray.rllib.models.modelv2 import ModelV2, restore_original_dimensions
 from ray.rllib.models.torch.torch_action_dist import TorchCategorical
 from ray.rllib.utils.annotations import override
@@ -13,7 +13,12 @@ torch, nn = try_import_torch()
 
 
 class JobActionMaskModel(TorchModelV2, nn.Module):
-    """PyTorch version of above ActionMaskingModel."""
+    """
+    PyTorch version of ActionMaskingModel with Preference-Driven Multi-Objective support.
+    
+    This model accepts observations that include both the original features and preference vectors.
+    The preference is concatenated with the observation before being fed to the network.
+    """
 
     def __init__(
         self,
@@ -29,6 +34,7 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
             isinstance(orig_space, Dict)
             and "action_mask" in orig_space.spaces
             and "observation" in orig_space.spaces
+            and "preference" in orig_space.spaces  # PD-MORL: 确认 preference 存在
         )
 
         TorchModelV2.__init__(
@@ -36,8 +42,37 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
         )
         nn.Module.__init__(self)
 
+        # PD-MORL: 获取原始观测和偏好的维度
+        self.obs_shape = orig_space["observation"].shape  # (MAX_JOBS, n_features)
+        self.preference_dim = orig_space["preference"].shape[0]  # reward_size (通常是 2)
+        
+        # PD-MORL: 为 imitation learning 保存不含偏好的原始观测空间
+        self.orig_obs_space_for_il = Dict({
+            "observation": orig_space["observation"],
+            "action_mask": orig_space["action_mask"]
+        })
+        
+        # PD-MORL: 计算展平后的观测维度
+        # observation 是二维的 (MAX_JOBS, n_features)，需要展平
+        self.obs_dim = 1
+        for dim in self.obs_shape:
+            self.obs_dim *= dim
+        
+        # PD-MORL: 创建组合空间（observation + preference）
+        # 新的输入维度 = 展平的观测维度 + 偏好维度
+        combined_dim = self.obs_dim + self.preference_dim
+        
+        # 创建一个临时的 Box 空间来初始化 internal_model
+        from gymnasium.spaces import Box
+        combined_space = Box(
+            low=-float('inf'), 
+            high=float('inf'), 
+            shape=(combined_dim,),
+            dtype=orig_space["observation"].dtype
+        )
+        
         self.internal_model = TorchFC(
-            orig_space["observation"],
+            combined_space,
             action_space,
             num_outputs,
             model_config,
@@ -48,9 +83,23 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
     def forward(self, input_dict, state, seq_lens):
         # Extract the available actions tensor from the observation.
         action_mask = input_dict["obs"]["action_mask"]
+        
+        # PD-MORL: 提取观测和偏好
+        observation = input_dict["obs"]["observation"]
+        preference = input_dict["obs"]["preference"]
+        
+        # PD-MORL: 展平观测 (batch_size, MAX_JOBS, n_features) -> (batch_size, obs_dim)
+        batch_size = observation.shape[0]
+        observation_flat = observation.reshape(batch_size, -1)
+        
+        # PD-MORL: 拼接观测和偏好
+        # observation_flat: (batch_size, obs_dim)
+        # preference: (batch_size, preference_dim)
+        # combined: (batch_size, obs_dim + preference_dim)
+        combined_input = torch.cat([observation_flat, preference], dim=1)
 
-        # Compute the unmasked logits.
-        logits, _ = self.internal_model({"obs": input_dict["obs"]["observation"]})
+        # Compute the unmasked logits using the combined input
+        logits, _ = self.internal_model({"obs": combined_input})
 
         # Convert action_mask into a [0.0 || -inf]-type mask.
         inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
@@ -69,11 +118,19 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
             # Get the next batch from our input files.
             batch = generate_sample_batch(batch_type="job")
 
+            # PD-MORL: 使用不含偏好的原始观测空间进行维度还原
             obs = restore_original_dimensions(
                 torch.from_numpy(batch["obs_flat"]).float().to(policy_loss[0].device),
-                self.obs_space,
+                self.orig_obs_space_for_il,  # 使用不含偏好的空间
                 tensorlib="torch",
             )
+            
+            # PD-MORL: 为 imitation learning 添加虚拟偏好向量（全零）
+            # 因为 IL 数据不包含偏好，我们使用中性偏好 [0.5, 0.5]
+            batch_size = obs["observation"].shape[0]
+            dummy_preference = torch.ones(batch_size, self.preference_dim, device=policy_loss[0].device) * 0.5
+            obs["preference"] = dummy_preference
+            
             logits, _ = self.forward({"obs": obs}, [], None)
 
             action_mask = obs["action_mask"]
@@ -105,7 +162,12 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
 
 
 class MachineActionMaskModel(TorchModelV2, nn.Module):
-    """PyTorch version of above ActionMaskingModel."""
+    """
+    PyTorch version of ActionMaskingModel with Preference-Driven Multi-Objective support.
+    
+    This model accepts observations that include both the original features and preference vectors.
+    The preference is concatenated with the observation before being fed to the network.
+    """
 
     def __init__(
         self,
@@ -121,6 +183,7 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
             isinstance(orig_space, Dict)
             and "action_mask" in orig_space.spaces
             and "observation" in orig_space.spaces
+            and "preference" in orig_space.spaces  # PD-MORL: 确认 preference 存在
         )
 
         TorchModelV2.__init__(
@@ -128,8 +191,34 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
         )
         nn.Module.__init__(self)
 
+        # PD-MORL: 获取原始观测和偏好的维度
+        self.obs_shape = orig_space["observation"].shape  # (MAX_MACHINES, n_features)
+        self.preference_dim = orig_space["preference"].shape[0]  # reward_size
+        
+        # PD-MORL: 为 imitation learning 保存不含偏好的原始观测空间
+        self.orig_obs_space_for_il = Dict({
+            "observation": orig_space["observation"],
+            "action_mask": orig_space["action_mask"]
+        })
+        
+        # PD-MORL: 计算展平后的观测维度
+        self.obs_dim = 1
+        for dim in self.obs_shape:
+            self.obs_dim *= dim
+        
+        # PD-MORL: 创建组合空间（observation + preference）
+        combined_dim = self.obs_dim + self.preference_dim
+        
+        from gymnasium.spaces import Box
+        combined_space = Box(
+            low=-float('inf'), 
+            high=float('inf'), 
+            shape=(combined_dim,),
+            dtype=orig_space["observation"].dtype
+        )
+        
         self.internal_model = TorchFC(
-            orig_space["observation"],
+            combined_space,
             action_space,
             num_outputs,
             model_config,
@@ -139,9 +228,20 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
     def forward(self, input_dict, state, seq_lens):
         # Extract the available actions tensor from the observation.
         action_mask = input_dict["obs"]["action_mask"]
+        
+        # PD-MORL: 提取观测和偏好
+        observation = input_dict["obs"]["observation"]
+        preference = input_dict["obs"]["preference"]
+        
+        # PD-MORL: 展平观测
+        batch_size = observation.shape[0]
+        observation_flat = observation.reshape(batch_size, -1)
+        
+        # PD-MORL: 拼接观测和偏好
+        combined_input = torch.cat([observation_flat, preference], dim=1)
 
         # Compute the unmasked logits.
-        logits, _ = self.internal_model({"obs": input_dict["obs"]["observation"]})
+        logits, _ = self.internal_model({"obs": combined_input})
 
         # Convert action_mask into a [0.0 || -inf]-type mask.
         inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
@@ -159,13 +259,18 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
             # Get the next batch from our input files.
             batch = generate_sample_batch(batch_type="machine")
 
-            # Define a secondary loss by building a graph copy with weight sharing.
-            # obs = batch["obs"]
+            # PD-MORL: 使用不含偏好的原始观测空间进行维度还原
             obs = restore_original_dimensions(
                 torch.from_numpy(batch["obs_flat"]).float().to(policy_loss[0].device),
-                self.obs_space,
+                self.orig_obs_space_for_il,  # 使用不含偏好的空间
                 tensorlib="torch",
             )
+            
+            # PD-MORL: 为 imitation learning 添加虚拟偏好向量（全零）
+            batch_size = obs["observation"].shape[0]
+            dummy_preference = torch.ones(batch_size, self.preference_dim, device=policy_loss[0].device) * 0.5
+            obs["preference"] = dummy_preference
+            
             logits, _ = self.forward({"obs": obs}, [], None)
             action_mask = obs["action_mask"]
             # Convert action_mask into a [0.0 || -inf]-type mask.
@@ -194,7 +299,12 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
 
 
 class TransbotActionMaskModel(TorchModelV2, nn.Module):
-    """PyTorch version of above ActionMaskingModel."""
+    """
+    PyTorch version of ActionMaskingModel with Preference-Driven Multi-Objective support.
+    
+    This model accepts observations that include both the original features and preference vectors.
+    The preference is concatenated with the observation before being fed to the network.
+    """
 
     def __init__(
         self,
@@ -210,14 +320,41 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
                 isinstance(orig_space, Dict)
                 and "action_mask" in orig_space.spaces
                 and "observation" in orig_space.spaces
+                and "preference" in orig_space.spaces  # PD-MORL: 确认 preference 存在
         )
         TorchModelV2.__init__(
             self, obs_space, action_space, num_outputs, model_config, name, **kwargs
         )
         nn.Module.__init__(self)
 
+        # PD-MORL: 获取原始观测和偏好的维度
+        self.obs_shape = orig_space["observation"].shape  # (MAX_TRANSBOTS, n_features)
+        self.preference_dim = orig_space["preference"].shape[0]  # reward_size
+        
+        # PD-MORL: 为 imitation learning 保存不含偏好的原始观测空间
+        self.orig_obs_space_for_il = Dict({
+            "observation": orig_space["observation"],
+            "action_mask": orig_space["action_mask"]
+        })
+        
+        # PD-MORL: 计算展平后的观测维度
+        self.obs_dim = 1
+        for dim in self.obs_shape:
+            self.obs_dim *= dim
+        
+        # PD-MORL: 创建组合空间（observation + preference）
+        combined_dim = self.obs_dim + self.preference_dim
+        
+        from gymnasium.spaces import Box
+        combined_space = Box(
+            low=-float('inf'), 
+            high=float('inf'), 
+            shape=(combined_dim,),
+            dtype=orig_space["observation"].dtype
+        )
+        
         self.internal_model = TorchFC(
-            orig_space["observation"],
+            combined_space,
             action_space,
             num_outputs,
             model_config,
@@ -227,9 +364,20 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
     @override(ModelV2)
     def forward(self, input_dict, state, seq_lens):
         action_mask = input_dict["obs"]["action_mask"]
+        
+        # PD-MORL: 提取观测和偏好
+        observation = input_dict["obs"]["observation"]
+        preference = input_dict["obs"]["preference"]
+        
+        # PD-MORL: 展平观测
+        batch_size = observation.shape[0]
+        observation_flat = observation.reshape(batch_size, -1)
+        
+        # PD-MORL: 拼接观测和偏好
+        combined_input = torch.cat([observation_flat, preference], dim=1)
 
         # Compute the unmasked logits.
-        logits, _ = self.internal_model({"obs": input_dict["obs"]["observation"]})
+        logits, _ = self.internal_model({"obs": combined_input})
 
         # Convert action_mask into a [0.0 || -inf]-type mask.
         inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
@@ -248,11 +396,18 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
             # Get the next batch from our input files.
             batch = generate_sample_batch(batch_type="transbot")
 
+            # PD-MORL: 使用不含偏好的原始观测空间进行维度还原
             obs = restore_original_dimensions(
                 torch.from_numpy(batch["obs_flat"]).float().to(policy_loss[0].device),
-                self.obs_space,
+                self.orig_obs_space_for_il,  # 使用不含偏好的空间
                 tensorlib="torch",
             )
+            
+            # PD-MORL: 为 imitation learning 添加虚拟偏好向量（全零）
+            batch_size = obs["observation"].shape[0]
+            dummy_preference = torch.ones(batch_size, self.preference_dim, device=policy_loss[0].device) * 0.5
+            obs["preference"] = dummy_preference
+            
             logits, _ = self.forward({"obs": obs}, [], None)
             action_mask = obs["action_mask"]
             # Convert action_mask into a [0.0 || -inf]-type mask.

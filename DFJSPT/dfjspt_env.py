@@ -19,6 +19,7 @@ from DFJSPT.dfjspt_data.dfjspt_data_generator import generate_a_complete_instanc
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 
 from DFJSPT.dfjspt_rule.dfjspt_rule9_FDDMTWR_EET_EET import rule9_a_makespan
+from DFJSPT.dfjspt_rule.dfjspt_rule7_MTWR_EET_EET import rule7_a_makespan
 
 # from ray.rllib.utils.spaces.repeated import Repeated
 
@@ -98,6 +99,17 @@ class DfjsptMaEnv(MultiAgentEnv):
         self.n_job_features = 8
         self.n_machine_features = 7
         self.n_transbot_features = 7
+        
+        # ------ Multi-Objective RL parameters ------ #
+        self.reward_size = 2  # Two objectives: Makespan and Total Tardiness
+        # Read preference batch from config, default to [1.0, 0.0] (pure makespan optimization)
+        if "w_batch_set" in env_config:
+            self.w_batch_set = np.array(env_config["w_batch_set"])
+        else:
+            self.w_batch_set = np.array([[1.0, 0.0]])
+        self.current_w = self.w_batch_set[0].copy()  # Current episode preference
+        self._episode_end_info = None  # Temporary storage for episode end info
+        
         makespan_upper_bound = 10 * MAX_JOBS * MAX_MACHINES * (dfjspt_params.max_prcs_time + dfjspt_params.max_tspt_time)
 
         if env_config["train_or_eval_or_test"] == "train":
@@ -149,8 +161,12 @@ class DfjsptMaEnv(MultiAgentEnv):
         self.drl_minus_rule = 0
         self.prev_cmax = None
         self.curr_cmax = None
+        self.prev_tardiness = 0.0  # Previous step's total tardiness
+        self.curr_tardiness = 0.0  # Current step's total tardiness
+        self.total_mean_processing_time = 1.0  # Normalization baseline N2 for tardiness (avoid division by zero)
         self.result_start_time_for_jobs = None
         self.result_finish_time_for_jobs = None
+        self.job_due_dates = None  # Due dates for jobs (for Total Tardiness calculation)
         self.current_instance_id = 0
         self.instance_count = 0
 
@@ -188,6 +204,9 @@ class DfjsptMaEnv(MultiAgentEnv):
                 "observation": Box(-1, makespan_upper_bound,
                                    shape=(MAX_JOBS, self.n_job_features),
                                    dtype=np.float64),
+                "preference": Box(0, 1,
+                                  shape=(self.reward_size,),
+                                  dtype=np.float32),
             }),
 
             "agent1": Dict({
@@ -198,6 +217,9 @@ class DfjsptMaEnv(MultiAgentEnv):
                 "observation": Box(-1, makespan_upper_bound,
                                    shape=(MAX_MACHINES, self.n_machine_features),
                                    dtype=np.float64),
+                "preference": Box(0, 1,
+                                  shape=(self.reward_size,),
+                                  dtype=np.float32),
             }),
 
             "agent2": Dict({
@@ -208,6 +230,9 @@ class DfjsptMaEnv(MultiAgentEnv):
                 "observation": Box(-1, makespan_upper_bound,
                                    shape=(MAX_TRANSBOTS, self.n_transbot_features),
                                    dtype=np.float64),
+                "preference": Box(0, 1,
+                                  shape=(self.reward_size,),
+                                  dtype=np.float32),
             }),
         })
 
@@ -249,6 +274,7 @@ class DfjsptMaEnv(MultiAgentEnv):
                     #     for job_id in range(self.n_jobs)
                     # ],
                     "observation": self.job_features,
+                    "preference": self.current_w.astype(np.float32),
                 },
             }
         elif self.stage == 1:
@@ -260,6 +286,7 @@ class DfjsptMaEnv(MultiAgentEnv):
                     #     for machine_id in range(self.n_machines)
                     # ],
                     "observation": self.machine_features,
+                    "preference": self.current_w.astype(np.float32),
                 },
             }
         else:
@@ -271,6 +298,7 @@ class DfjsptMaEnv(MultiAgentEnv):
                     #     for transbot_id in range(self.n_transbots)
                     # ],
                     "observation": self.transbot_features,
+                    "preference": self.current_w.astype(np.float32),
                 }
             }
 
@@ -352,13 +380,16 @@ class DfjsptMaEnv(MultiAgentEnv):
                 #     [0 if value <= 0 else 1 for value in self.processing_time_matrix[job_id][operation_id]]
                 self.mean_processing_time_of_operations[job_id][operation_id] = np.mean(processing_time_of_operations)
         self.mean_cumulative_processing_time_of_jobs = np.cumsum(self.mean_processing_time_of_operations, axis=1)
-        # self.rule_makespan_for_current_instance = np.max(self.mean_cumulative_processing_time_of_jobs)
 
-        # if self.rule_makespan_results:
-        #     self.rule_makespan_for_current_instance = self.rule_makespan_results[self.current_instance_id]
-        # else:
-        #     self.rule_makespan_for_current_instance = np.max(self.mean_cumulative_processing_time_of_jobs)
-        self.rule_makespan_for_current_instance = rule9_a_makespan(instance)
+        # Calculate Tardiness normalization baseline (N2)
+        # Sum of all jobs' total mean processing time + epsilon to avoid division by zero
+        self.total_mean_processing_time = self.mean_cumulative_processing_time_of_jobs[:, -1].sum() + 1e-6
+        
+        t_makespan2, t_tardiness = rule9_a_makespan(instance)
+        t_makespan = rule7_a_makespan(instance)
+        print(f"Rule 7 Makespan: {t_makespan}, Rule 9 Makespan: {t_makespan2}, Rule 9 Tardiness: {t_tardiness}")
+        self.rule_makespan_for_current_instance = t_makespan
+        self.rule_tardiness_for_current_instance = t_tardiness
         del instance
 
         # generate colors for machines
@@ -422,15 +453,62 @@ class DfjsptMaEnv(MultiAgentEnv):
         self.transbot_action_mask = np.zeros((MAX_TRANSBOTS,), dtype=int)
         self.transbot_action_mask[:self.n_transbots] = 1
 
+        # Generate due dates for each job (for Total Tardiness objective)
+        # Due date is based on arrival time + a multiplier of the mean cumulative processing time
+        # Multiplier: due_date_factor (CRITICAL: smaller value = tighter deadline = more tardiness pressure)
+        # 1.3 creates moderate pressure, balancing makespan and tardiness objectives
+        total_proc_times = self.mean_cumulative_processing_time_of_jobs[:, -1]
+        due_date_factor = 1.5  # Tighter deadline to create tardiness pressure
+        self.job_due_dates = self.job_arrival_time + (total_proc_times * due_date_factor)
+
         self.prev_cmax = 0
         self.curr_cmax = 0
+        self.prev_tardiness = 0.0  # Reset tardiness tracking
+        self.curr_tardiness = 0.0
         self.reward_this_step = 0.0
         self.schedule_done = False
         self.stage = 0
+        
+        # Sample a preference vector for this episode
+        preference_idx = np.random.randint(0, len(self.w_batch_set))
+        self.current_w = self.w_batch_set[preference_idx].copy()
+        
         observations = self._get_obs()
         info = self._get_info()
 
         return observations, info
+
+    def get_total_tardiness(self):
+        """
+        Calculate the total tardiness across all jobs.
+        For completed jobs: Tardiness = max(0, completion_time - due_date)
+        For uncompleted jobs: Estimated tardiness based on current progress
+        
+        This provides dense reward signals throughout the episode.
+        """
+        total_tardiness = 0.0
+        for job_id in range(self.n_jobs):
+            due_date = self.job_due_dates[job_id]
+            
+            # Check if job is completed
+            if self.job_features[job_id, 4] == 1:
+                # Job completed - use actual completion time
+                last_operation_id = self.n_operations_for_jobs[job_id] - 1
+                completion_time = self.result_finish_time_for_jobs[job_id, last_operation_id, 1]
+            else:
+                # Job not completed - estimate completion time
+                # Current time: last finished operation time or arrival time
+                current_time = float(self.job_features[job_id, 2])
+                # Remaining processing time: stored in job_features[:, 7]
+                remaining_time = float(self.job_features[job_id, 7])
+                # Estimated completion time
+                completion_time = current_time + remaining_time
+            
+            # Calculate tardiness
+            tardiness = max(0.0, completion_time - due_date)
+            total_tardiness += tardiness
+        
+        return total_tardiness
 
     def step(self, action):
         observations, reward, terminated, truncated, info = {}, {}, {}, {}, {}
@@ -443,16 +521,44 @@ class DfjsptMaEnv(MultiAgentEnv):
             if self.chosen_job >= self.n_jobs or self.chosen_job < 0:
                 self.schedule_done = min(self.job_features[:, 4]) >= 1
                 if self.schedule_done:
+                    # Episode finished due to invalid action - no reward, just terminate
                     self.final_makespan = self.curr_cmax
-                    self.reward_this_step = self.reward_this_step + 1
-                for i in range(3):
-                    reward["agent{}".format(i)] = self.reward_this_step
-                    terminated["agent{}".format(i)] = self.schedule_done
-                    if terminated["agent{}".format(i)]:
-                        self.terminateds.add("agent{}".format(i))
-                    truncated["agent{}".format(i)] = False
+                    self.curr_tardiness = self.get_total_tardiness()
+                    
+                    # Store final objectives for info
+                    obj_makespan = -self.final_makespan
+                    obj_tardiness = -self.curr_tardiness
+                    reward_vector = np.array([obj_makespan, obj_tardiness], dtype=np.float32)
+                    
+                    self._episode_end_info = {
+                        "objectives": reward_vector.copy(),
+                        "current_w": self.current_w.copy(),
+                        "makespan": self.final_makespan,
+                        "total_tardiness": self.curr_tardiness,
+                    }
+                    
+                    for i in range(3):
+                        agent_id = "agent{}".format(i)
+                        reward[agent_id] = 0.0  # No reward for invalid action
+                        terminated[agent_id] = True
+                        self.terminateds.add(agent_id)
+                        truncated[agent_id] = False
+                else:
+                    for i in range(3):
+                        agent_id = "agent{}".format(i)
+                        reward[agent_id] = 0.0
+                        terminated[agent_id] = False
+                        truncated[agent_id] = False
                 observations = self._get_obs()
-                info = self._get_info()
+                
+                # Add episode end info only to active agents in observations
+                if hasattr(self, '_episode_end_info') and self._episode_end_info:
+                    for agent_id in observations.keys():
+                        info[agent_id] = self._episode_end_info.copy()
+                    self._episode_end_info = None
+                else:
+                    info = self._get_info()
+                    
                 terminated["__all__"] = len(self.terminateds) == len(self.agents)
                 truncated["__all__"] = False
                 return observations, reward, terminated, truncated, info
@@ -465,16 +571,43 @@ class DfjsptMaEnv(MultiAgentEnv):
             if self.operation_id >= self.n_operations_for_jobs[self.chosen_job] or self.operation_id < 0:
                 self.schedule_done = min(self.job_features[:, 4]) >= 1
                 if self.schedule_done:
+                    # Episode finished due to invalid action - no reward
                     self.final_makespan = self.curr_cmax
-                    self.reward_this_step = self.reward_this_step + 1
-                for i in range(3):
-                    reward["agent{}".format(i)] = self.reward_this_step
-                    terminated["agent{}".format(i)] = self.schedule_done
-                    if terminated["agent{}".format(i)]:
-                        self.terminateds.add("agent{}".format(i))
-                    truncated["agent{}".format(i)] = False
+                    self.curr_tardiness = self.get_total_tardiness()
+                    
+                    obj_makespan = -self.final_makespan
+                    obj_tardiness = -self.curr_tardiness
+                    reward_vector = np.array([obj_makespan, obj_tardiness], dtype=np.float32)
+                    
+                    self._episode_end_info = {
+                        "objectives": reward_vector.copy(),
+                        "current_w": self.current_w.copy(),
+                        "makespan": self.final_makespan,
+                        "total_tardiness": self.curr_tardiness,
+                    }
+                    
+                    for i in range(3):
+                        agent_id = "agent{}".format(i)
+                        reward[agent_id] = 0.0  # No reward for invalid action
+                        terminated[agent_id] = True
+                        self.terminateds.add(agent_id)
+                        truncated[agent_id] = False
+                else:
+                    for i in range(3):
+                        agent_id = "agent{}".format(i)
+                        reward[agent_id] = 0.0
+                        terminated[agent_id] = False
+                        truncated[agent_id] = False
                 observations = self._get_obs()
-                info = self._get_info()
+                
+                # Add episode end info only to active agents
+                if hasattr(self, '_episode_end_info') and self._episode_end_info:
+                    for agent_id in observations.keys():
+                        info[agent_id] = self._episode_end_info.copy()
+                    self._episode_end_info = None
+                else:
+                    info = self._get_info()
+                    
                 terminated["__all__"] = len(self.terminateds) == len(self.agents)
                 truncated["__all__"] = False
                 return observations, reward, terminated, truncated, info
@@ -502,16 +635,43 @@ class DfjsptMaEnv(MultiAgentEnv):
             if self.chosen_machine >= self.n_machines or self.chosen_machine < 0 or self.machine_features[self.chosen_machine, 5] <= 0:
                 self.schedule_done = min(self.job_features[:, 4]) >= 1
                 if self.schedule_done:
+                    # Episode finished due to invalid action - no reward
                     self.final_makespan = self.curr_cmax
-                    self.reward_this_step = self.reward_this_step + 1
-                for i in range(3):
-                    reward["agent{}".format(i)] = self.reward_this_step
-                    terminated["agent{}".format(i)] = self.schedule_done
-                    if terminated["agent{}".format(i)]:
-                        self.terminateds.add("agent{}".format(i))
-                    truncated["agent{}".format(i)] = False
+                    self.curr_tardiness = self.get_total_tardiness()
+                    
+                    obj_makespan = -self.final_makespan
+                    obj_tardiness = -self.curr_tardiness
+                    reward_vector = np.array([obj_makespan, obj_tardiness], dtype=np.float32)
+                    
+                    self._episode_end_info = {
+                        "objectives": reward_vector.copy(),
+                        "current_w": self.current_w.copy(),
+                        "makespan": self.final_makespan,
+                        "total_tardiness": self.curr_tardiness,
+                    }
+                    
+                    for i in range(3):
+                        agent_id = "agent{}".format(i)
+                        reward[agent_id] = 0.0  # No reward for invalid action
+                        terminated[agent_id] = True
+                        self.terminateds.add(agent_id)
+                        truncated[agent_id] = False
+                else:
+                    for i in range(3):
+                        agent_id = "agent{}".format(i)
+                        reward[agent_id] = 0.0
+                        terminated[agent_id] = False
+                        truncated[agent_id] = False
                 observations = self._get_obs()
-                info = self._get_info()
+                
+                # Add episode end info only to active agents
+                if hasattr(self, '_episode_end_info') and self._episode_end_info:
+                    for agent_id in observations.keys():
+                        info[agent_id] = self._episode_end_info.copy()
+                    self._episode_end_info = None
+                else:
+                    info = self._get_info()
+                    
                 terminated["__all__"] = len(self.terminateds) == len(self.agents)
                 truncated["__all__"] = False
                 return observations, reward, terminated, truncated, info
@@ -525,7 +685,12 @@ class DfjsptMaEnv(MultiAgentEnv):
             self.stage = 2
 
         else:
+            # Stage 2: Transbot selection
             self.chosen_transbot = action["agent2"]
+            
+            # Store previous state values for reward shaping (before scheduling)
+            self.prev_cmax = self.curr_cmax
+            self.prev_tardiness = self.curr_tardiness
 
             tspt_result = self._schedule_tspt_task(
                 job_id=self.chosen_job,
@@ -549,32 +714,82 @@ class DfjsptMaEnv(MultiAgentEnv):
             self.machine_features[:self.n_machines, 5:] = -1
             self.transbot_features[:self.n_transbots, 6] = -1
 
-            self.prev_cmax = self.curr_cmax
+            # Update current state (after scheduling)
             self.curr_cmax = self.result_finish_time_for_jobs.max()
-
-            self.reward_this_step = self.reward_this_step + 1.0 * (self.prev_cmax - self.curr_cmax) / self.rule_makespan_for_current_instance
-            # self.reward_this_step = self.reward_this_step + (self.prev_cmax - self.curr_cmax)
+            self.curr_tardiness = self.get_total_tardiness()
+            
+            # Calculate improvements
+            makespan_improvement = self.prev_cmax - self.curr_cmax
+            tardiness_improvement = self.prev_tardiness - self.curr_tardiness
+            
+            # Normalize improvements using independent baselines
+            # N1: Makespan baseline (rule-based makespan)
+            # N2: Tardiness baseline (total mean processing time)
+            norm_makespan_impr = makespan_improvement / self.rule_makespan_for_current_instance
+            norm_tardiness_impr = tardiness_improvement / self.rule_tardiness_for_current_instance
+            print(f"Norm Makespan Impr: {norm_makespan_impr}, Norm Tardiness Impr: {norm_tardiness_impr}")
+            
+            # Construct normalized improvement vector
+            improvement_vector = np.array([norm_makespan_impr, norm_tardiness_impr], dtype=np.float32)
+            
+            # Calculate preference-weighted dense shaping reward
+            self.reward_this_step = np.dot(self.current_w, improvement_vector)
 
             self.schedule_done = min(self.job_features[:, 4]) == 1
             if self.schedule_done:
+                # Episode is finished - add terminal bonus to shaping reward
+                self.reward_this_step = self.reward_this_step + 1.0  # Terminal bonus
+                
+                # Calculate final multi-objective values (negative for maximization)
                 self.final_makespan = self.curr_cmax
                 self.drl_minus_rule = self.final_makespan - self.rule_makespan_for_current_instance
-                self.reward_this_step = self.reward_this_step + 1
+                
+                obj_makespan = -self.final_makespan
+                obj_tardiness = -self.curr_tardiness
+                
+                # Create absolute objective vector for info storage
+                reward_vector = np.array([obj_makespan, obj_tardiness], dtype=np.float32)
+                
+                # Store objectives info temporarily for later assignment to active agents
+                self._episode_end_info = {
+                    "objectives": reward_vector.copy(),
+                    "current_w": self.current_w.copy(),
+                    "makespan": self.final_makespan,
+                    "total_tardiness": self.curr_tardiness,
+                }
+                
+                # Assign rewards and terminated flags
+                for i in range(3):
+                    agent_id = "agent{}".format(i)
+                    reward[agent_id] = self.reward_this_step
+                    terminated[agent_id] = True
+                    self.terminateds.add(agent_id)
+                    truncated[agent_id] = False
+                
                 self.instance_count += 1
                 if self.instance_count >= self.end_of_instance_pool - self.start_of_instance_pool:
                     self.instance_count = 0
-
-            for i in range(3):
-                reward["agent{}".format(i)] = self.reward_this_step
-                terminated["agent{}".format(i)] = self.schedule_done
-                if terminated["agent{}".format(i)]:
-                    self.terminateds.add("agent{}".format(i))
-                truncated["agent{}".format(i)] = False
+            else:
+                # Episode not finished - assign intermediate shaping reward
+                for i in range(3):
+                    agent_id = "agent{}".format(i)
+                    reward[agent_id] = self.reward_this_step
+                    terminated[agent_id] = False
+                    truncated[agent_id] = False
 
             self.stage = 0
 
         observations = self._get_obs()
-        info = self._get_info()
+        
+        # Handle episode end info - only add to active agent(s) in observations
+        if hasattr(self, '_episode_end_info') and self._episode_end_info:
+            for agent_id in observations.keys():
+                info[agent_id] = self._episode_end_info.copy()
+            delattr(self, '_episode_end_info')  # Clean up temporary storage
+        
+        # Only update info if it hasn't been set (for non-termination cases)
+        if not info:
+            info = self._get_info()
         terminated["__all__"] = len(self.terminateds) == len(self.agents)
         truncated["__all__"] = False
 

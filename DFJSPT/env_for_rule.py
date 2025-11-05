@@ -235,6 +235,12 @@ class DfjsptMaEnv_for_rule(MultiAgentEnv):
         self.transbot_action_mask = np.zeros((MAX_TRANSBOTS,), dtype=int)
         self.transbot_action_mask[:self.n_transbots] = 1
 
+        # Generate due dates for each job (for Total Tardiness calculation)
+        # Due date is based on arrival time + a multiplier of the mean cumulative processing time
+        total_proc_times = self.mean_cumulative_processing_time_of_jobs[:, -1]
+        due_date_factor = 1.5  # Same as in dfjspt_env.py
+        self.job_due_dates = self.job_arrival_time + (total_proc_times * due_date_factor)
+
         self.prev_cmax = 0
         self.curr_cmax = 0
         self.reward_this_step = 0.0
@@ -244,6 +250,35 @@ class DfjsptMaEnv_for_rule(MultiAgentEnv):
         info = self._get_info()
 
         return observations, info
+
+    def get_total_tardiness(self):
+        """
+        Calculate the total tardiness across all jobs.
+        Tardiness = max(0, completion_time - due_date)
+        
+        Returns:
+            total_tardiness (float): Sum of tardiness across all jobs
+        """
+        total_tardiness = 0.0
+        for job_id in range(self.n_jobs):
+            due_date = self.job_due_dates[job_id]
+            
+            # Check if job is completed
+            if self.job_features[job_id, 4] == 1:
+                # Job completed - use actual completion time
+                last_operation_id = self.n_operations_for_jobs[job_id] - 1
+                completion_time = self.result_finish_time_for_jobs[job_id, last_operation_id, 1]
+            else:
+                # Job not completed - estimate completion time
+                current_time = float(self.job_features[job_id, 2])
+                remaining_time = float(self.job_features[job_id, 7])
+                completion_time = current_time + remaining_time
+            
+            # Calculate tardiness
+            tardiness = max(0.0, completion_time - due_date)
+            total_tardiness += tardiness
+        
+        return total_tardiness
 
     def step(self, action):
         observations, reward, terminated, truncated, info = {}, {}, {}, {}, {}

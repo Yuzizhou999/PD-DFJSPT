@@ -1,0 +1,56 @@
+{
+    "experiments": [
+        {
+            "name": "exp_001_baseline",
+            "description": "基准实验：标准 PD-MORL 训练配置",
+            "params": {
+                "n_jobs": 10,
+                "n_machines": 5,
+                "n_transbots": 3,
+                "stop_iters": 200,
+                "use_tune": true,
+                "n_instances_for_training": 5000,
+                "num_workers": 4
+            }
+        },
+        {
+            "name": "exp_002_more_instances",
+            "description": "变体实验：增加训练实例数（10000）",
+            "params": {
+                "n_jobs": 10,
+                "n_machines": 5,
+                "n_transbots": 3,
+                "stop_iters": 200,
+                "use_tune": true,
+                "n_instances_for_training": 10000,
+                "num_workers": 4
+            }
+        },
+        {
+            "name": "exp_003_more_workers",
+            "description": "变体实验：增加 Worker 数量（8）",
+            "params": {
+                "n_jobs": 10,
+                "n_machines": 5,
+                "n_transbots": 3,
+                "stop_iters": 200,
+                "use_tune": true,
+                "n_instances_for_training": 5000,
+                "num_workers": 8
+            }
+        },
+        {
+            "name": "exp_004_longer_training",
+            "description": "变体实验：延长训练迭代（500）",
+            "params": {
+                "n_jobs": 10,
+                "n_machines": 5,
+                "n_transbots": 3,
+                "stop_iters": 500,
+                "use_tune": true,
+                "n_instances_for_training": 5000,
+                "num_workers": 4
+            }
+        }
+    ]
+}

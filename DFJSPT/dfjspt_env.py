@@ -307,6 +307,14 @@ class DfjsptMaEnv(MultiAgentEnv):
         self.terminateds = set()
         self.truncateds = set()
 
+        # ++++++++++++++++ 评估模式支持 (开始) ++++++++++++++++
+        # 检查是否为评估模式，即是否指定了特定的偏好向量
+        is_eval_mode = False
+        if options and "eval_preference" in options:
+            self.current_w = np.array(options["eval_preference"], dtype=np.float32)
+            is_eval_mode = True
+        # ++++++++++++++++ 评估模式支持 (结束) ++++++++++++++++
+
         # We need the following line to seed self.np_random
         super().reset(seed=seed)
         # self.instance = random.choice(self.my_instance_pool)
@@ -387,7 +395,7 @@ class DfjsptMaEnv(MultiAgentEnv):
         
         t_makespan2, t_tardiness = rule9_a_makespan(instance)
         t_makespan = rule7_a_makespan(instance)
-        print(f"Rule 7 Makespan: {t_makespan}, Rule 9 Makespan: {t_makespan2}, Rule 9 Tardiness: {t_tardiness}")
+        # print(f"Rule 7 Makespan: {t_makespan}, Rule 9 Makespan: {t_makespan2}, Rule 9 Tardiness: {t_tardiness}")
         self.rule_makespan_for_current_instance = t_makespan
         self.rule_tardiness_for_current_instance = t_tardiness
         del instance
@@ -469,9 +477,13 @@ class DfjsptMaEnv(MultiAgentEnv):
         self.schedule_done = False
         self.stage = 0
         
-        # Sample a preference vector for this episode
-        preference_idx = np.random.randint(0, len(self.w_batch_set))
-        self.current_w = self.w_batch_set[preference_idx].copy()
+        # ++++++++++++++++ 修改偏好采样逻辑 (开始) ++++++++++++++++
+        # 只有在非评估模式下才随机采样偏好向量
+        # 在评估模式下，current_w 已经在函数开头被设置
+        if not is_eval_mode:
+            preference_idx = np.random.randint(0, len(self.w_batch_set))
+            self.current_w = self.w_batch_set[preference_idx].copy()
+        # ++++++++++++++++ 修改偏好采样逻辑 (结束) ++++++++++++++++
         
         observations = self._get_obs()
         info = self._get_info()
@@ -727,7 +739,7 @@ class DfjsptMaEnv(MultiAgentEnv):
             # N2: Tardiness baseline (total mean processing time)
             norm_makespan_impr = makespan_improvement / self.rule_makespan_for_current_instance
             norm_tardiness_impr = tardiness_improvement / self.rule_tardiness_for_current_instance
-            print(f"Norm Makespan Impr: {norm_makespan_impr}, Norm Tardiness Impr: {norm_tardiness_impr}")
+            # print(f"Norm Makespan Impr: {norm_makespan_impr}, Norm Tardiness Impr: {norm_tardiness_impr}")
             
             # Construct normalized improvement vector
             improvement_vector = np.array([norm_makespan_impr, norm_tardiness_impr], dtype=np.float32)

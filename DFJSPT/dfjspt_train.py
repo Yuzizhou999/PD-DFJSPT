@@ -20,10 +20,15 @@ from typing import Dict
 # import torch
 # import numpy as np
 
+import sys
+import os
+curPath = os.path.abspath(os.path.dirname(__file__))
+rootPath = os.path.split(curPath)[0]
+sys.path.append(rootPath)
+
 from DFJSPT import dfjspt_params
 from DFJSPT.dfjspt_env import DfjsptMaEnv
 from DFJSPT.dfjspt_agent_model import JobActionMaskModel, MachineActionMaskModel, TransbotActionMaskModel
-
 
 def generate_w_batch(reward_size, step_size):
     """
@@ -65,7 +70,7 @@ def create_env_with_preferences(env_config):
     
     # 定义目标数量和偏好采样精细度
     REWARD_SIZE = 2
-    W_STEP_SIZE = 0.1
+    W_STEP_SIZE = 0.05
     
     # 生成完整的偏好集合
     full_w_batch = generate_w_batch(REWARD_SIZE, W_STEP_SIZE)
@@ -90,7 +95,7 @@ def create_env_with_preferences(env_config):
     # 打印详细信息（包含进程ID和偏好范围，避免Ray日志去重）
     pid = os.getpid()
     w_range = f"[{worker_w_set[0][0]:.1f},{worker_w_set[0][1]:.1f}] ~ [{worker_w_set[-1][0]:.1f},{worker_w_set[-1][1]:.1f}]"
-    print(f"🔧 Worker-{worker_index}/{num_workers} (PID={pid}): 分配 {len(worker_w_set)} 个偏好，范围 {w_range}")
+    print(f" Worker-{worker_index}/{num_workers} (PID={pid}): 分配 {len(worker_w_set)} 个偏好，范围 {w_range}")
     
     # 创建并返回环境实例
     return DfjsptMaEnv(env_config)
@@ -164,7 +169,7 @@ class MyCallbacks(DefaultCallbacks):
             **kwargs
     ):
         """采样结束时的回调 - 用于监控采样性能"""
-        print(f"✅ Worker PID={os.getpid()} 完成采样: {len(samples)} steps")
+        print(f" Worker PID={os.getpid()} 完成采样: {len(samples)} steps")
 
 
 class MyTrainable(tune.Trainable):
@@ -201,8 +206,21 @@ if __name__ == "__main__":
         print(
             f"Start training with {dfjspt_params.n_jobs} jobs, {dfjspt_params.n_machines} machines, and {dfjspt_params.n_transbots} transbots.")
 
-        log_dir = os.path.dirname(__file__) + "/training_results/J" + str(
+        # 基础 log_dir（基于问题规模）
+        base_log_dir = os.path.dirname(__file__) + "/training_results/J" + str(
             dfjspt_params.n_jobs) + "_M" + str(dfjspt_params.n_machines) + "_T" + str(dfjspt_params.n_transbots)
+        
+        # 检查是否有环境变量指定的实验名称（由 RUN_EXPERIMENTS.py 设置）
+        experiment_name = os.environ.get('DFJSPT_EXPERIMENT_NAME', None)
+        
+        if experiment_name:
+            # 如果有实验名称，创建独立的子目录
+            log_dir = os.path.join(base_log_dir, experiment_name)
+            print(f"  实验名称: {experiment_name}")
+            print(f"  结果保存到: {log_dir}")
+        else:
+            # 否则使用基础目录（保持向后兼容）
+            log_dir = base_log_dir
 
         # 注册自定义模型
         ModelCatalog.register_custom_model(
@@ -338,6 +356,12 @@ if __name__ == "__main__":
             config = PPOConfig().update_from_dict(my_config)
             algo = config.build()
 
+            # 记录最佳性能
+            best_makespan = float('inf')
+            best_checkpoint_path = None
+            best_iteration = 0
+            best_result_info = {}
+            
             for i in range(dfjspt_params.stop_iters):
                 result = algo.train()
                 if result["custom_metrics"]["total_makespan_mean"] <= result["custom_metrics"][
@@ -345,6 +369,28 @@ if __name__ == "__main__":
                     dfjspt_params.use_custom_loss = False
                 if result["episodes_total"] >= 1e+5:
                     dfjspt_params.use_custom_loss = False
+                
+                # 检查是否是最佳性能
+                current_makespan = result["custom_metrics"]["total_makespan_mean"]
+                if current_makespan < best_makespan:
+                    best_makespan = current_makespan
+                    best_iteration = i
+                    # 保存当前最佳检查点
+                    best_checkpoint_path = algo.save()
+                    
+                    # 保存详细信息
+                    best_result_info = {
+                        "makespan": current_makespan,
+                        "rule_makespan": result["custom_metrics"].get("instance_rule_makespan_mean"),
+                        "tardiness": result["custom_metrics"].get("objectives_tardiness_mean"),
+                        "total_tardiness": result["custom_metrics"].get("total_tardiness_mean"),
+                        "drl_minus_rule": result["custom_metrics"].get("drl_minus_rule_mean"),
+                    }
+                    
+                    print(f" 新的最佳 makespan: {best_makespan:.2f} (iteration {i})")
+                    if best_result_info.get("tardiness") is not None:
+                        print(f"   Tardiness: {best_result_info['tardiness']:.2f}")
+                
                 if i % 5 == 0:
                     print(pretty_print(result))
                 if i % 20 == 0:
@@ -353,6 +399,68 @@ if __name__ == "__main__":
 
             checkpoint_dir_end = algo.save()
             print(f"Checkpoint saved in directory {checkpoint_dir_end}")
+            
+            # 复制最佳检查点到固定位置
+            if best_checkpoint_path is not None:
+                best_checkpoint_dir = os.path.join(log_dir, "best_checkpoint")
+                
+                import shutil
+                if os.path.exists(best_checkpoint_dir):
+                    shutil.rmtree(best_checkpoint_dir)
+                shutil.copytree(best_checkpoint_path, best_checkpoint_dir)
+                
+                print(f"\n{'='*80}")
+                print(f"最佳检查点信息 (手动训练):")
+                print(f"  源路径: {best_checkpoint_path}")
+                print(f"  最佳 makespan: {best_makespan:.2f}")
+                print(f"  规则 makespan: {best_result_info.get('rule_makespan', 'N/A')}")
+                if best_result_info.get('tardiness') is not None:
+                    print(f"  Tardiness (objectives): {best_result_info['tardiness']:.2f}")
+                if best_result_info.get('total_tardiness') is not None:
+                    print(f"  Total tardiness: {best_result_info['total_tardiness']:.2f}")
+                print(f"  最佳迭代: {best_iteration}")
+                print(f"  已复制到: {best_checkpoint_dir}")
+                
+                # 辅助函数：将 numpy 类型转换为 Python 原生类型
+                def convert_to_native_type(value):
+                    """将 numpy 类型转换为 JSON 可序列化的 Python 原生类型"""
+                    if value is None:
+                        return None
+                    # 处理 numpy 数值类型
+                    if hasattr(value, 'item'):  # numpy 标量
+                        return value.item()
+                    # 处理 numpy 数组
+                    if hasattr(value, 'tolist'):
+                        return value.tolist()
+                    # 处理字典
+                    if isinstance(value, dict):
+                        return {k: convert_to_native_type(v) for k, v in value.items()}
+                    # 处理列表
+                    if isinstance(value, (list, tuple)):
+                        return [convert_to_native_type(v) for v in value]
+                    # 其他类型直接返回
+                    return value
+                
+                # 保存元信息
+                best_info_path = os.path.join(log_dir, "best_checkpoint_info.json")
+                best_info = {
+                    "checkpoint_path": best_checkpoint_dir,
+                    "original_path": best_checkpoint_path,
+                    "best_makespan": convert_to_native_type(best_makespan),
+                    "rule_makespan": convert_to_native_type(best_result_info.get('rule_makespan')),
+                    "objectives_tardiness": convert_to_native_type(best_result_info.get('tardiness')),
+                    "total_tardiness": convert_to_native_type(best_result_info.get('total_tardiness')),
+                    "drl_minus_rule": convert_to_native_type(best_result_info.get('drl_minus_rule')),
+                    "best_iteration": convert_to_native_type(best_iteration),
+                    "total_iterations": convert_to_native_type(dfjspt_params.stop_iters),
+                }
+                
+                with open(best_info_path, 'w') as f:
+                    json.dump(best_info, f, indent=4)
+                
+                print(f"  元信息已保存: {best_info_path}")
+                print(f"{'='*80}\n")
+            
             algo.stop()
         else:
             # automated run with Tune and grid search and TensorBoard
@@ -365,20 +473,140 @@ if __name__ == "__main__":
                 run_config=air.RunConfig(
                     stop=stop,
                     name=log_dir,
-                    checkpoint_config=train.CheckpointConfig(checkpoint_frequency=10, checkpoint_at_end=True),
+                    checkpoint_config=train.CheckpointConfig(
+                        checkpoint_frequency=1, 
+                        checkpoint_at_end=True,
+                        
+                        # 2. 告知 Tune 如何对检查点进行评分
+                        checkpoint_score_attribute="custom_metrics/total_makespan_mean",
+                        
+                        # 3. 告知 Tune 分数越低越好
+                        checkpoint_score_order="min",
+                        
+                        # 4. 告知 Tune 只保留得分最高的那个检查点
+                        num_to_keep=1),
                 ),
             )
             results = tuner.fit()
+            print(f"All results: {results}")
 
             # Get the best result based on a particular metric.
             best_result = results.get_best_result(metric="custom_metrics/total_makespan_mean", mode="min")
-            print(best_result)
+            print(f"Best result: {best_result}")
 
             # Get the best checkpoint corresponding to the best result.
             best_checkpoint = best_result.checkpoint
-            print(best_checkpoint)
+            print(f"Best checkpoint: {best_checkpoint}")
+            
+            # 保存最佳检查点到固定位置，方便测试使用
+            if best_checkpoint is not None:
+                best_checkpoint_dir = os.path.join(log_dir, "best_checkpoint")
+                
+                # 从 checkpoint 对象中获取检查点路径
+                if hasattr(best_checkpoint, 'path'):
+                    checkpoint_path = best_checkpoint.path
+                elif hasattr(best_checkpoint, 'to_directory'):
+                    # Ray 2.x 新 API
+                    checkpoint_path = best_checkpoint.to_directory()
+                else:
+                    checkpoint_path = str(best_checkpoint)
+                
+                # 获取指标 - 处理不同的键名格式
+                metrics = best_result.metrics
+                
+                # 尝试不同的键名格式
+                makespan_mean = (
+                    metrics.get('custom_metrics/total_makespan_mean') or
+                    metrics.get('custom_metrics', {}).get('total_makespan_mean') or
+                    metrics.get('evaluation', {}).get('custom_metrics', {}).get('total_makespan_mean')
+                )
+                
+                rule_makespan_mean = (
+                    metrics.get('custom_metrics/instance_rule_makespan_mean') or
+                    metrics.get('custom_metrics', {}).get('instance_rule_makespan_mean') or
+                    metrics.get('evaluation', {}).get('custom_metrics', {}).get('instance_rule_makespan_mean')
+                )
+                
+                tardiness_mean = (
+                    metrics.get('custom_metrics/objectives_tardiness_mean') or
+                    metrics.get('custom_metrics', {}).get('objectives_tardiness_mean') or
+                    metrics.get('evaluation', {}).get('custom_metrics', {}).get('objectives_tardiness_mean')
+                )
+                
+                total_tardiness_mean = (
+                    metrics.get('custom_metrics/total_tardiness_mean') or
+                    metrics.get('custom_metrics', {}).get('total_tardiness_mean') or
+                    metrics.get('evaluation', {}).get('custom_metrics', {}).get('total_tardiness_mean')
+                )
+                
+                print(f"\n{'='*80}")
+                print(f"最佳检查点信息:")
+                print(f"  源路径: {checkpoint_path}")
+                print(f"  最佳 makespan: {makespan_mean if makespan_mean is not None else 'N/A'}")
+                print(f"  规则 makespan: {rule_makespan_mean if rule_makespan_mean is not None else 'N/A'}")
+                print(f"  Tardiness (objectives): {tardiness_mean if tardiness_mean is not None else 'N/A'}")
+                print(f"  Total tardiness: {total_tardiness_mean if total_tardiness_mean is not None else 'N/A'}")
+                print(f"  训练迭代: {metrics.get('training_iteration', 'N/A')}")
+                
+                # 复制检查点到固定位置
+                import shutil
+                if os.path.exists(best_checkpoint_dir):
+                    shutil.rmtree(best_checkpoint_dir)
+                shutil.copytree(checkpoint_path, best_checkpoint_dir)
+                
+                print(f"  已复制到: {best_checkpoint_dir}")
+                
+                # 保存最佳检查点的元信息
+                best_info_path = os.path.join(log_dir, "best_checkpoint_info.json")
+                
+                # 辅助函数：将 numpy 类型转换为 Python 原生类型
+                def convert_to_native_type(value):
+                    """将 numpy 类型转换为 JSON 可序列化的 Python 原生类型"""
+                    if value is None:
+                        return None
+                    # 处理 numpy 数值类型
+                    if hasattr(value, 'item'):  # numpy 标量
+                        return value.item()
+                    # 处理 numpy 数组
+                    if hasattr(value, 'tolist'):
+                        return value.tolist()
+                    # 处理字典
+                    if isinstance(value, dict):
+                        return {k: convert_to_native_type(v) for k, v in value.items()}
+                    # 处理列表
+                    if isinstance(value, (list, tuple)):
+                        return [convert_to_native_type(v) for v in value]
+                    # 其他类型直接返回
+                    return value
+                
+                best_info = {
+                    "checkpoint_path": best_checkpoint_dir,
+                    "original_path": checkpoint_path,
+                    "total_makespan_mean": convert_to_native_type(makespan_mean),
+                    "instance_rule_makespan_mean": convert_to_native_type(rule_makespan_mean),
+                    "objectives_tardiness_mean": convert_to_native_type(tardiness_mean),
+                    "total_tardiness_mean": convert_to_native_type(total_tardiness_mean),
+                    "training_iteration": convert_to_native_type(metrics.get('training_iteration')),
+                    "episodes_total": convert_to_native_type(metrics.get('episodes_total')),
+                    "timestamp": convert_to_native_type(metrics.get('timestamp')),
+                    # 保存所有 custom_metrics 以便调试
+                    "all_custom_metrics": convert_to_native_type({
+                        k: v for k, v in metrics.items() 
+                        if k.startswith('custom_metrics')
+                    })
+                }
+                
+                with open(best_info_path, 'w') as f:
+                    json.dump(best_info, f, indent=4)
+                
+                print(f"  元信息已保存: {best_info_path}")
+                print(f"{'='*80}\n")
+                
+                # 打印如何使用此检查点进行测试
+                print(f"使用最佳检查点进行测试:")
+                print(f"  checkpoint_path = '{best_checkpoint_dir}'")
+                print(f"  或读取元信息: json.load(open('{best_info_path}'))")
+            else:
+                print("\n警告: 未找到最佳检查点！")
 
         ray.shutdown()
-
-
-

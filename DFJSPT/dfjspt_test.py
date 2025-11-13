@@ -285,7 +285,7 @@ def main():
     # TODO: 修改为你想要评估的 checkpoint 路径
     checkpoint_path = os.path.dirname(__file__) + "/training_results/J" + str(
         dfjspt_params.n_jobs) + "_M" + str(dfjspt_params.n_machines) + "_T" + str(
-        dfjspt_params.n_transbots) + '/MyTrainable_DfjsptMaEnv_PDMORL_64dd8_00000_0_2025-11-07_13-41-23/checkpoint_000005'
+        dfjspt_params.n_transbots) + '/MyTrainable_DfjsptMaEnv_PDMORL_4a8c7_00000_0_2025-11-10_10-02-20/checkpoint_000258'
     
     print(f"正在加载 checkpoint: {checkpoint_path}")
     
@@ -303,7 +303,7 @@ def main():
     
     # ========== 生成"考卷" (偏好向量集合) ========== #
     REWARD_SIZE = 2  # Makespan 和 Tardiness
-    W_STEP_SIZE = 0.1  # 偏好向量步长（可调整精细度）
+    W_STEP_SIZE = 0.05  # 偏好向量步长（可调整精细度）
     
     print(f"正在生成偏好向量集合（步长={W_STEP_SIZE}）...")
     w_batch_eval = generate_w_batch_eval(REWARD_SIZE, W_STEP_SIZE)

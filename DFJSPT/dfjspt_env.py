@@ -525,6 +525,7 @@ class DfjsptMaEnv(MultiAgentEnv):
     def step(self, action):
         observations, reward, terminated, truncated, info = {}, {}, {}, {}, {}
         self.reward_this_step = 0.0
+        reward_vector = np.zeros(self.reward_size, dtype=np.float32)
 
         if self.stage == 0:
             self.chosen_job = action["agent0"]
@@ -540,13 +541,14 @@ class DfjsptMaEnv(MultiAgentEnv):
                     # Store final objectives for info
                     obj_makespan = -self.final_makespan
                     obj_tardiness = -self.curr_tardiness
-                    reward_vector = np.array([obj_makespan, obj_tardiness], dtype=np.float32)
+                    terminal_objectives = np.array([obj_makespan, obj_tardiness], dtype=np.float32)
                     
                     self._episode_end_info = {
-                        "objectives": reward_vector.copy(),
+                        "objectives": terminal_objectives.copy(),
                         "current_w": self.current_w.copy(),
                         "makespan": self.final_makespan,
                         "total_tardiness": self.curr_tardiness,
+                        "reward_vector": reward_vector.copy(),
                     }
                     
                     for i in range(3):
@@ -570,6 +572,10 @@ class DfjsptMaEnv(MultiAgentEnv):
                     self._episode_end_info = None
                 else:
                     info = self._get_info()
+                
+                for agent_id in observations.keys():
+                    agent_info = info.setdefault(agent_id, {})
+                    agent_info["reward_vector"] = reward_vector.copy()
                     
                 terminated["__all__"] = len(self.terminateds) == len(self.agents)
                 truncated["__all__"] = False
@@ -589,13 +595,14 @@ class DfjsptMaEnv(MultiAgentEnv):
                     
                     obj_makespan = -self.final_makespan
                     obj_tardiness = -self.curr_tardiness
-                    reward_vector = np.array([obj_makespan, obj_tardiness], dtype=np.float32)
+                    terminal_objectives = np.array([obj_makespan, obj_tardiness], dtype=np.float32)
                     
                     self._episode_end_info = {
-                        "objectives": reward_vector.copy(),
+                        "objectives": terminal_objectives.copy(),
                         "current_w": self.current_w.copy(),
                         "makespan": self.final_makespan,
                         "total_tardiness": self.curr_tardiness,
+                        "reward_vector": reward_vector.copy(),
                     }
                     
                     for i in range(3):
@@ -611,7 +618,7 @@ class DfjsptMaEnv(MultiAgentEnv):
                         terminated[agent_id] = False
                         truncated[agent_id] = False
                 observations = self._get_obs()
-                
+
                 # Add episode end info only to active agents
                 if hasattr(self, '_episode_end_info') and self._episode_end_info:
                     for agent_id in observations.keys():
@@ -619,7 +626,11 @@ class DfjsptMaEnv(MultiAgentEnv):
                     self._episode_end_info = None
                 else:
                     info = self._get_info()
-                    
+                
+                for agent_id in observations.keys():
+                    agent_info = info.setdefault(agent_id, {})
+                    agent_info["reward_vector"] = reward_vector.copy()
+
                 terminated["__all__"] = len(self.terminateds) == len(self.agents)
                 truncated["__all__"] = False
                 return observations, reward, terminated, truncated, info
@@ -653,13 +664,14 @@ class DfjsptMaEnv(MultiAgentEnv):
                     
                     obj_makespan = -self.final_makespan
                     obj_tardiness = -self.curr_tardiness
-                    reward_vector = np.array([obj_makespan, obj_tardiness], dtype=np.float32)
+                    terminal_objectives = np.array([obj_makespan, obj_tardiness], dtype=np.float32)
                     
                     self._episode_end_info = {
-                        "objectives": reward_vector.copy(),
+                        "objectives": terminal_objectives.copy(),
                         "current_w": self.current_w.copy(),
                         "makespan": self.final_makespan,
                         "total_tardiness": self.curr_tardiness,
+                        "reward_vector": reward_vector.copy(),
                     }
                     
                     for i in range(3):
@@ -683,7 +695,11 @@ class DfjsptMaEnv(MultiAgentEnv):
                     self._episode_end_info = None
                 else:
                     info = self._get_info()
-                    
+                
+                for agent_id in observations.keys():
+                    agent_info = info.setdefault(agent_id, {})
+                    agent_info["reward_vector"] = reward_vector.copy()
+
                 terminated["__all__"] = len(self.terminateds) == len(self.agents)
                 truncated["__all__"] = False
                 return observations, reward, terminated, truncated, info
@@ -743,7 +759,8 @@ class DfjsptMaEnv(MultiAgentEnv):
             
             # Construct normalized improvement vector
             improvement_vector = np.array([norm_makespan_impr, norm_tardiness_impr], dtype=np.float32)
-            
+            reward_vector = improvement_vector.copy()
+
             # Calculate preference-weighted dense shaping reward
             self.reward_this_step = np.dot(self.current_w, improvement_vector)
 
@@ -760,14 +777,15 @@ class DfjsptMaEnv(MultiAgentEnv):
                 obj_tardiness = -self.curr_tardiness
                 
                 # Create absolute objective vector for info storage
-                reward_vector = np.array([obj_makespan, obj_tardiness], dtype=np.float32)
+                terminal_objectives = np.array([obj_makespan, obj_tardiness], dtype=np.float32)
                 
                 # Store objectives info temporarily for later assignment to active agents
                 self._episode_end_info = {
-                    "objectives": reward_vector.copy(),
+                    "objectives": terminal_objectives.copy(),
                     "current_w": self.current_w.copy(),
                     "makespan": self.final_makespan,
                     "total_tardiness": self.curr_tardiness,
+                    "reward_vector": reward_vector.copy(),
                 }
                 
                 # Assign rewards and terminated flags
@@ -802,6 +820,11 @@ class DfjsptMaEnv(MultiAgentEnv):
         # Only update info if it hasn't been set (for non-termination cases)
         if not info:
             info = self._get_info()
+
+        for agent_id in observations.keys():
+            agent_info = info.setdefault(agent_id, {})
+            agent_info["reward_vector"] = reward_vector.copy()
+            
         terminated["__all__"] = len(self.terminateds) == len(self.agents)
         truncated["__all__"] = False
 

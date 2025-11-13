@@ -1,5 +1,7 @@
 import json
 import os
+import warnings
+import time
 import itertools
 import numpy as np
 import ray
@@ -13,22 +15,140 @@ from ray.rllib.algorithms.callbacks import DefaultCallbacks
 from ray.rllib.env import BaseEnv
 from ray.rllib.evaluation import Episode, RolloutWorker
 from ray.rllib.policy import Policy
-from ray.rllib.policy.sample_batch import SampleBatch
+from ray.rllib.policy.sample_batch import SampleBatch, concat_samples
 # from ray.rllib.algorithms.algorithm import Algorithm
 from typing import Dict
 # from gymnasium import spaces
 # import torch
 # import numpy as np
 
-import sys
-import os
-curPath = os.path.abspath(os.path.dirname(__file__))
-rootPath = os.path.split(curPath)[0]
-sys.path.append(rootPath)
+# import sys
+# import os
+# curPath = os.path.abspath(os.path.dirname(__file__))
+# rootPath = os.path.split(curPath)[0]
+# sys.path.append(rootPath)
 
 from DFJSPT import dfjspt_params
 from DFJSPT.dfjspt_env import DfjsptMaEnv
 from DFJSPT.dfjspt_agent_model import JobActionMaskModel, MachineActionMaskModel, TransbotActionMaskModel
+
+# 原来就有的 base_log_dir
+base_log_dir = os.path.join(
+    os.path.dirname(__file__),
+    f"training_results/J{dfjspt_params.n_jobs}_M{dfjspt_params.n_machines}_T{dfjspt_params.n_transbots}"
+)
+os.makedirs(base_log_dir, exist_ok=True)
+
+# 用环境变量给名字更可控；否则用时间戳保证唯一
+experiment_name = os.environ.get("DFJSPT_EXPERIMENT_NAME",
+                                 time.strftime("exp_%Y%m%d_%H%M%S"))
+
+def postprocess_her_trajectory(
+        policy: Policy,
+        batch: SampleBatch,
+        *,
+        reward_size: int | None = None,
+):
+    """Augment a trajectory with hindsight preference relabelling.
+
+    Args:
+        policy: Policy owning the trajectory (used for config lookup).
+        batch: The postprocessed sample batch.
+        reward_size: Optional override for the preference dimensionality.
+
+    Returns:
+        SampleBatch containing the concatenated original and hindsight data.
+    """
+    if batch.count == 0 or not batch[SampleBatch.DONES][-1]:
+        return batch
+
+    terminal_info = batch[SampleBatch.INFOS][-1]
+    if not isinstance(terminal_info, dict):
+        return batch
+
+    objectives = terminal_info.get("objectives")
+    if objectives is None:
+        return batch
+
+    objectives = np.asarray(objectives, dtype=np.float32).reshape(-1)
+
+    config = getattr(policy, "config", {}) if policy is not None else {}
+    if reward_size is None:
+        reward_size = (config.get("env_config", {}) or {}).get("reward_size")
+        if reward_size is None:
+            reward_size = (config.get("model", {}).get("custom_model_config", {})
+                           .get("reward_size"))
+    if reward_size is not None:
+        reward_size = int(reward_size)
+
+    obs_preferences = None
+    if isinstance(batch[SampleBatch.OBS], dict):
+        obs_preferences = batch[SampleBatch.OBS].get("preference")
+
+    if reward_size is None and isinstance(obs_preferences, np.ndarray):
+        reward_size = obs_preferences.shape[-1]
+
+    if reward_size is None:
+        reward_size = objectives.shape[0]
+
+    if objectives.shape[0] != reward_size:
+        reward_size = min(reward_size, objectives.shape[0])
+        objectives = objectives[:reward_size]
+
+    abs_objectives = np.abs(objectives)
+    denom = abs_objectives.sum()
+    if denom <= np.finfo(np.float32).eps:
+        w_hindsight = np.full(reward_size, 1.0 / reward_size, dtype=np.float32)
+    else:
+        w_hindsight = abs_objectives / denom
+
+    her_batch = batch.copy()
+
+    if isinstance(her_batch[SampleBatch.OBS], dict):
+        obs_dict = dict(her_batch[SampleBatch.OBS])
+        preference_values = obs_dict.get("preference")
+        if isinstance(preference_values, np.ndarray):
+            pref_batch = preference_values.shape[0]
+            obs_dict["preference"] = np.repeat(
+                w_hindsight.reshape(1, -1), pref_batch, axis=0
+            ).astype(preference_values.dtype)
+            her_batch[SampleBatch.OBS] = obs_dict
+
+    her_rewards = her_batch[SampleBatch.REWARDS]
+    her_rewards[-1] = float(np.dot(w_hindsight, objectives))
+    her_batch[SampleBatch.REWARDS] = her_rewards
+
+    her_infos = list(her_batch[SampleBatch.INFOS])
+    if her_infos:
+        last_info = her_infos[-1]
+        if isinstance(last_info, dict):
+            updated_info = dict(last_info)
+            updated_info["current_w"] = w_hindsight.astype(np.float32)
+            her_infos[-1] = updated_info
+    her_batch[SampleBatch.INFOS] = np.array(her_infos, dtype=object)
+
+    return concat_samples([batch, her_batch])
+
+class DfjsptAgentModel:
+    """Namespace object for DFJSPT custom model registrations."""
+
+    JOB = "job_agent_model"
+    MACHINE = "machine_agent_model"
+    TRANSBOT = "transbot_agent_model"
+    _registered = False
+
+    @classmethod
+    def register_all(cls):
+        if cls._registered:
+            return
+
+        ModelCatalog.register_custom_model(cls.JOB, JobActionMaskModel)
+        ModelCatalog.register_custom_model(cls.MACHINE, MachineActionMaskModel)
+        ModelCatalog.register_custom_model(cls.TRANSBOT, TransbotActionMaskModel)
+        cls._registered = True
+
+
+DfjsptAgentModel.register_all()
 
 def generate_w_batch(reward_size, step_size):
     """
@@ -207,8 +327,11 @@ if __name__ == "__main__":
             f"Start training with {dfjspt_params.n_jobs} jobs, {dfjspt_params.n_machines} machines, and {dfjspt_params.n_transbots} transbots.")
 
         # 基础 log_dir（基于问题规模）
-        base_log_dir = os.path.dirname(__file__) + "/training_results/J" + str(
-            dfjspt_params.n_jobs) + "_M" + str(dfjspt_params.n_machines) + "_T" + str(dfjspt_params.n_transbots)
+        base_log_dir = os.path.join(
+            os.path.dirname(__file__),
+            f"training_results/J{dfjspt_params.n_jobs}_M{dfjspt_params.n_machines}_T{dfjspt_params.n_transbots}"
+        )
+        os.makedirs(base_log_dir, exist_ok=True)
         
         # 检查是否有环境变量指定的实验名称（由 RUN_EXPERIMENTS.py 设置）
         experiment_name = os.environ.get('DFJSPT_EXPERIMENT_NAME', None)
@@ -221,17 +344,6 @@ if __name__ == "__main__":
         else:
             # 否则使用基础目录（保持向后兼容）
             log_dir = base_log_dir
-
-        # 注册自定义模型
-        ModelCatalog.register_custom_model(
-            "job_agent_model", JobActionMaskModel
-        )
-        ModelCatalog.register_custom_model(
-            "machine_agent_model", MachineActionMaskModel
-        )
-        ModelCatalog.register_custom_model(
-            "transbot_agent_model", TransbotActionMaskModel
-        )
         
         # 注册带有偏好分配的自定义环境创建器
         tune.register_env("DfjsptMaEnv_PDMORL", create_env_with_preferences)
@@ -248,7 +360,7 @@ if __name__ == "__main__":
                 example_env.observation_space["agent0"],
                 example_env.action_space["agent0"],
                 {"model": {
-                    "custom_model": "job_agent_model",
+                    "custom_model": DfjsptAgentModel.JOB,
                     "fcnet_hiddens": [256, 256],
                     "fcnet_activation": "tanh",
                 }}),
@@ -258,7 +370,7 @@ if __name__ == "__main__":
                 example_env.observation_space["agent1"],
                 example_env.action_space["agent1"],
                 {"model": {
-                    "custom_model": "machine_agent_model",
+                    "custom_model": DfjsptAgentModel.MACHINE,
                     "fcnet_hiddens": [256, 256],
                     "fcnet_activation": "tanh",
                 }}),
@@ -268,7 +380,7 @@ if __name__ == "__main__":
                 example_env.observation_space["agent2"],
                 example_env.action_space["agent2"],
                 {"model": {
-                    "custom_model": "transbot_agent_model",
+                    "custom_model": DfjsptAgentModel.TRANSBOT,
                     "fcnet_hiddens": [128, 128],
                         "fcnet_activation": "tanh",
                 }}),
@@ -342,6 +454,9 @@ if __name__ == "__main__":
             "policies": policies,
             "policy_mapping_fn": policy_mapping_fn,
         }
+
+        if dfjspt_params.use_her:
+            my_config["postprocess_trajectory"] = postprocess_her_trajectory
 
         stop = {
             "training_iteration": dfjspt_params.stop_iters,
@@ -472,35 +587,59 @@ if __name__ == "__main__":
                 param_space=my_config,
                 run_config=air.RunConfig(
                     stop=stop,
-                    name=log_dir,
+                    name=experiment_name,
+                    storage_path=os.path.abspath(base_log_dir),
                     checkpoint_config=train.CheckpointConfig(
-                        checkpoint_frequency=1, 
+                        checkpoint_frequency=5, 
                         checkpoint_at_end=True,
                         
-                        # 2. 告知 Tune 如何对检查点进行评分
-                        checkpoint_score_attribute="custom_metrics/total_makespan_mean",
+                        # # 2. 告知 Tune 如何对检查点进行评分
+                        # checkpoint_score_attribute="custom_metrics/total_makespan_mean",
                         
-                        # 3. 告知 Tune 分数越低越好
-                        checkpoint_score_order="min",
+                        # # 3. 告知 Tune 分数越低越好
+                        # checkpoint_score_order="min",
                         
                         # 4. 告知 Tune 只保留得分最高的那个检查点
-                        num_to_keep=1),
+                        num_to_keep=None),
                 ),
             )
             results = tuner.fit()
-            print(f"All results: {results}")
+            # print(f"All results: {results}")
 
             # Get the best result based on a particular metric.
             best_result = results.get_best_result(metric="custom_metrics/total_makespan_mean", mode="min")
-            print(f"Best result: {best_result}")
+            # print(f"Best result: {best_result}")
 
             # Get the best checkpoint corresponding to the best result.
             best_checkpoint = best_result.checkpoint
-            print(f"Best checkpoint: {best_checkpoint}")
+            # print(f"Best checkpoint: {best_checkpoint}")
             
             # 保存最佳检查点到固定位置，方便测试使用
             if best_checkpoint is not None:
-                best_checkpoint_dir = os.path.join(log_dir, "best_checkpoint")
+                # 获取实验目录 - 处理 experiment_name 可能为 None 的情况
+                if experiment_name:
+                    experiment_dir = os.path.join(base_log_dir, experiment_name)
+                else:
+                    # 从 best_result 获取实际的实验目录
+                    # best_result.log_dir 或 best_result.path 包含完整路径
+                    if hasattr(best_result, 'log_dir'):
+                        experiment_dir = best_result.log_dir
+                    elif hasattr(best_result, 'path'):
+                        experiment_dir = os.path.dirname(best_result.path)
+                    else:
+                        # 从 checkpoint 路径推断
+                        if hasattr(best_checkpoint, 'path'):
+                            checkpoint_path_str = best_checkpoint.path
+                        elif hasattr(best_checkpoint, 'to_directory'):
+                            checkpoint_path_str = best_checkpoint.to_directory()
+                        else:
+                            checkpoint_path_str = str(best_checkpoint)
+                        # checkpoint 路径格式: .../experiment_dir/trial_dir/checkpoint_xxx
+                        # 我们需要 trial_dir
+                        experiment_dir = os.path.dirname(os.path.dirname(checkpoint_path_str))
+                
+                best_checkpoint_dir = os.path.join(experiment_dir, "best_checkpoint")
+                best_info_path = os.path.join(experiment_dir, "best_checkpoint_info.json")
                 
                 # 从 checkpoint 对象中获取检查点路径
                 if hasattr(best_checkpoint, 'path'):
@@ -556,8 +695,8 @@ if __name__ == "__main__":
                 
                 print(f"  已复制到: {best_checkpoint_dir}")
                 
-                # 保存最佳检查点的元信息
-                best_info_path = os.path.join(log_dir, "best_checkpoint_info.json")
+                # 保存最佳检查点的元信息（使用前面定义的 best_info_path）
+                # best_info_path 已在前面定义，这里不需要重复定义
                 
                 # 辅助函数：将 numpy 类型转换为 Python 原生类型
                 def convert_to_native_type(value):
@@ -599,13 +738,9 @@ if __name__ == "__main__":
                 with open(best_info_path, 'w') as f:
                     json.dump(best_info, f, indent=4)
                 
-                print(f"  元信息已保存: {best_info_path}")
-                print(f"{'='*80}\n")
+                # print(f"  元信息已保存: {best_info_path}")
+                # print(f"{'='*80}\n")
                 
-                # 打印如何使用此检查点进行测试
-                print(f"使用最佳检查点进行测试:")
-                print(f"  checkpoint_path = '{best_checkpoint_dir}'")
-                print(f"  或读取元信息: json.load(open('{best_info_path}'))")
             else:
                 print("\n警告: 未找到最佳检查点！")
 

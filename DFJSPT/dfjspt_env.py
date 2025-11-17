@@ -107,6 +107,7 @@ class DfjsptMaEnv(MultiAgentEnv):
             self.w_batch_set = np.array(env_config["w_batch_set"])
         else:
             self.w_batch_set = np.array([[1.0, 0.0]])
+        self.preference_noise_scale = float(env_config.get("preference_noise_scale", 0.05)) # Default small noise scale
         self.current_w = self.w_batch_set[0].copy()  # Current episode preference
         self._episode_end_info = None  # Temporary storage for episode end info
         
@@ -482,7 +483,20 @@ class DfjsptMaEnv(MultiAgentEnv):
         # 在评估模式下，current_w 已经在函数开头被设置
         if not is_eval_mode:
             preference_idx = np.random.randint(0, len(self.w_batch_set))
-            self.current_w = self.w_batch_set[preference_idx].copy()
+            sampled_w = self.w_batch_set[preference_idx].astype(np.float32, copy=True)
+
+            if self.preference_noise_scale > 0:
+                noise = np.random.normal(
+                    loc=0.0,
+                    scale=self.preference_noise_scale,
+                    size=sampled_w.shape,
+                ).astype(np.float32)
+                noisy_w = np.clip(sampled_w + noise, 0.0, None)
+                noisy_sum = noisy_w.sum()
+                if noisy_sum > np.finfo(np.float32).eps:
+                    sampled_w = noisy_w / noisy_sum
+
+            self.current_w = sampled_w
         # ++++++++++++++++ 修改偏好采样逻辑 (结束) ++++++++++++++++
         
         observations = self._get_obs()

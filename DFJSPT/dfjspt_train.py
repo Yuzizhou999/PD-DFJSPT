@@ -59,28 +59,33 @@ def postprocess_her_trajectory(
     Returns:
         SampleBatch containing the concatenated original and hindsight data.
     """
+    # 只处理完整的一条 episode
     if batch.count == 0 or not batch[SampleBatch.DONES][-1]:
         return batch
-
+    
     terminal_info = batch[SampleBatch.INFOS][-1]
     if not isinstance(terminal_info, dict):
         return batch
 
-    objectives = terminal_info.get("objectives")
-    if objectives is None:
-        return batch
-
-    objectives = np.asarray(objectives, dtype=np.float32).reshape(-1)
-
+    # 推断 reward_size（偏好向量的维度）
+    # reward_size 的优先级：
+    # 函数参数传入
+    # env_config / model config
+    # obs["preference"] 的维度
     config = getattr(policy, "config", {}) if policy is not None else {}
+    # 如果没有传入，就从配置中找
     if reward_size is None:
+        # 先看 env_config["reward_size"]
         reward_size = (config.get("env_config", {}) or {}).get("reward_size")
         if reward_size is None:
+            # 再看 model.custom_model_config.reward_size
             reward_size = (config.get("model", {}).get("custom_model_config", {})
                            .get("reward_size"))
     if reward_size is not None:
+        # 转换为整数
         reward_size = int(reward_size)
 
+    # 尝试从观测里的 preference 推断 reward_size
     obs_preferences = None
     if isinstance(batch[SampleBatch.OBS], dict):
         obs_preferences = batch[SampleBatch.OBS].get("preference")
@@ -88,22 +93,59 @@ def postprocess_her_trajectory(
     if reward_size is None and isinstance(obs_preferences, np.ndarray):
         reward_size = obs_preferences.shape[-1]
 
-    if reward_size is None:
-        reward_size = objectives.shape[0]
+    # 从每步 infos 中提取 reward_vector
+    infos = list(batch[SampleBatch.INFOS])
+    reward_vectors = []
+    inferred_size = reward_size
+    for info in infos:
+        vec = None
+        if isinstance(info, dict) and "reward_vector" in info:
+            vec = np.asarray(info["reward_vector"], dtype=np.float32).reshape(-1)
+        if vec is not None and vec.size > 0:
+            reward_vectors.append(vec)
+            if inferred_size is None:
+                inferred_size = vec.shape[0]
+        else:
+            reward_vectors.append(None)
 
-    if objectives.shape[0] != reward_size:
-        reward_size = min(reward_size, objectives.shape[0])
-        objectives = objectives[:reward_size]
+    # 若还没能确定维度，用终结 info 的 objectives 作为后备
+    if inferred_size is None:
+        objectives = terminal_info.get("objectives")
+        if objectives is None:
+            return batch
+        objectives = np.asarray(objectives, dtype=np.float32).reshape(-1)
+        inferred_size = objectives.shape[0]
+    reward_size = inferred_size
 
-    abs_objectives = np.abs(objectives)
-    denom = abs_objectives.sum()
+    # 构造 reward_matrix（矩阵化每一步的 reward_vector）
+    reward_matrix = np.zeros((batch.count, reward_size), dtype=np.float32)
+    for idx, vec in enumerate(reward_vectors):
+        if isinstance(vec, np.ndarray):
+            length = min(vec.shape[0], reward_size)
+            reward_matrix[idx, :length] = vec[:length]
+
+    # 计算用于 hindsight 权重的 w_hindsight
+    return_vector = reward_matrix.sum(axis=0)
+    denom = np.abs(return_vector).sum()
+    if denom <= np.finfo(np.float32).eps:
+        objectives = terminal_info.get("objectives")
+        if objectives is not None:
+            objectives = np.asarray(objectives, dtype=np.float32).reshape(-1)
+            length = min(objectives.shape[0], reward_size)
+            fallback = np.abs(objectives[:length])
+            fallback_sum = fallback.sum()
+            if fallback_sum > np.finfo(np.float32).eps:
+                return_vector[:length] = fallback
+                denom = np.abs(return_vector).sum()
     if denom <= np.finfo(np.float32).eps:
         w_hindsight = np.full(reward_size, 1.0 / reward_size, dtype=np.float32)
     else:
-        w_hindsight = abs_objectives / denom
+        w_hindsight = np.abs(return_vector) / denom
 
+    # 克隆一份 batch，准备写 HER 版本
     her_batch = batch.copy()
 
+    # 修改 OBS 里的 preference 为 w_hindsight
     if isinstance(her_batch[SampleBatch.OBS], dict):
         obs_dict = dict(her_batch[SampleBatch.OBS])
         preference_values = obs_dict.get("preference")
@@ -114,17 +156,48 @@ def postprocess_her_trajectory(
             ).astype(preference_values.dtype)
             her_batch[SampleBatch.OBS] = obs_dict
 
-    her_rewards = her_batch[SampleBatch.REWARDS]
-    her_rewards[-1] = float(np.dot(w_hindsight, objectives))
+    # 修改 NEXT_OBS 里的 preference
+    if SampleBatch.NEXT_OBS in her_batch and isinstance(her_batch[SampleBatch.NEXT_OBS], dict):
+        next_obs_dict = dict(her_batch[SampleBatch.NEXT_OBS])
+        next_pref = next_obs_dict.get("preference")
+        if isinstance(next_pref, np.ndarray):
+            next_pref_batch = next_pref.shape[0]
+            next_obs_dict["preference"] = np.repeat(
+                w_hindsight.reshape(1, -1), next_pref_batch, axis=0
+            ).astype(next_pref.dtype)
+            her_batch[SampleBatch.NEXT_OBS] = next_obs_dict
+
+    # 计算 terminal_bonus，让最后一步 reward 对齐
+    terminal_bonus = 0.0
+    if isinstance(terminal_info, dict) and "current_w" in terminal_info:
+        last_reward_vec = reward_matrix[-1]
+        current_w = np.asarray(terminal_info["current_w"], dtype=np.float32).reshape(-1)
+        aligned = min(current_w.shape[0], reward_size)
+        if aligned > 0:
+            terminal_bonus = (
+                her_batch[SampleBatch.REWARDS][-1]
+                - float(np.dot(current_w[:aligned], last_reward_vec[:aligned]))
+            )
+
+    # 用 w_hindsight 计算新的 hindsight rewards，并加入 terminal_bonus
+    her_rewards = np.dot(reward_matrix, w_hindsight).astype(np.float32)
+    her_rewards[-1] = her_rewards[-1] + terminal_bonus
     her_batch[SampleBatch.REWARDS] = her_rewards
 
+    # 更新 her_batch 的 INFOS 字段：写入新的 current_w 和调整 reward_vector
     her_infos = list(her_batch[SampleBatch.INFOS])
     if her_infos:
-        last_info = her_infos[-1]
-        if isinstance(last_info, dict):
-            updated_info = dict(last_info)
-            updated_info["current_w"] = w_hindsight.astype(np.float32)
-            her_infos[-1] = updated_info
+        for idx, info in enumerate(her_infos):
+            if isinstance(info, dict):
+                updated_info = dict(info)
+                updated_info["current_w"] = w_hindsight.astype(np.float32)
+                if "reward_vector" in updated_info:
+                    reward_vec = np.asarray(updated_info["reward_vector"], dtype=np.float32)
+                    length = min(reward_vec.shape[-1], reward_size)
+                    reward_vec = reward_vec.copy()
+                    reward_vec[:length] = reward_matrix[idx, :length]
+                    updated_info["reward_vector"] = reward_vec
+                her_infos[idx] = updated_info
     her_batch[SampleBatch.INFOS] = np.array(her_infos, dtype=object)
 
     return concat_samples([batch, her_batch])

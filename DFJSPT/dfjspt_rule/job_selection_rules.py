@@ -1,6 +1,24 @@
 import numpy as np
 
 
+def _job_FDD_MTWR_scores(legal_job_actions, real_job_attrs):
+    """Return MTWR-style scores with invalid actions masked to -inf."""
+
+    job_actions_mask = (1 - legal_job_actions) * 1e8
+    jobs_cumulative_finished_work = real_job_attrs[:, 5]
+    jobs_remain_work = real_job_attrs[:, 7]
+    if np.any(jobs_remain_work == 0):
+        jobs_remain_work[jobs_remain_work == 0] = 0.001
+    jobs_ratio = 1.0 * jobs_cumulative_finished_work / jobs_remain_work
+    jobs_ratio += job_actions_mask
+
+    scores = np.full_like(jobs_ratio, -np.inf, dtype=np.float32)
+    valid_indices = np.where(legal_job_actions > 0)[0]
+    # Lower ratio is better, so flip the sign to convert into scores.
+    scores[valid_indices] = -jobs_ratio[valid_indices]
+    return scores
+
+
 def job_EST_action(legal_job_actions, real_job_attrs):
     job_actions_mask = (1 - legal_job_actions) * 1e8
     jobs_last_finish_time = real_job_attrs[:, 2]
@@ -57,21 +75,19 @@ def job_MTWR_action(legal_job_actions, real_job_attrs):
 
 
 def job_FDD_MTWR_action(legal_job_actions, real_job_attrs):
-    job_actions_mask = (1 - legal_job_actions) * 1e8
-    jobs_cumulative_finished_work = real_job_attrs[:, 5]
-    # jobs_cumulative_finished_work = np.zeros(len(legal_job_actions))
-    # jobs_cumulative_finished_work[:len(real_job_attrs)] = [obs[5] for obs in real_job_attrs]
-    jobs_remain_work = real_job_attrs[:, 7]
-    # jobs_remain_work = np.zeros(len(legal_job_actions))
-    # jobs_remain_work[:len(real_job_attrs)] = [obs[7] for obs in real_job_attrs]
-    if np.any(jobs_remain_work == 0):
-        jobs_remain_work[jobs_remain_work == 0] = 0.001
-    jobs_ratio = 1.0 * jobs_cumulative_finished_work / jobs_remain_work
-    jobs_ratio += job_actions_mask
+    scores = _job_FDD_MTWR_scores(legal_job_actions, real_job_attrs)
+    best_score = np.max(scores)
+    best_indices = np.where(scores == best_score)[0]
     FDD_MTWR_job_action = {
-        "agent0": np.argmin(jobs_ratio)
+        "agent0": int(np.random.choice(best_indices))
     }
     return FDD_MTWR_job_action
+
+
+def job_FDD_MTWR_scores(legal_job_actions, real_job_attrs):
+    """Public helper exposing FDD-MTWR teacher scores."""
+
+    return _job_FDD_MTWR_scores(legal_job_actions, real_job_attrs)
 
 
 

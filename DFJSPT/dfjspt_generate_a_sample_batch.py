@@ -5,27 +5,19 @@ import numpy as np
 from ray.rllib.evaluation.sample_batch_builder import SampleBatchBuilder
 from ray.rllib.policy.sample_batch import SampleBatch, concat_samples
 from DFJSPT.dfjspt_env_for_imitation import DfjsptMaEnv
-from DFJSPT.dfjspt_rule.job_selection_rules import job_FDD_MTWR_action
-from DFJSPT.dfjspt_rule.machine_selection_rules import machine_EET_action, transbot_EET_action
+from DFJSPT.dfjspt_rule.job_selection_rules import job_FDD_MTWR_action, job_FDD_MTWR_scores
+from DFJSPT.dfjspt_rule.machine_selection_rules import machine_EET_action, transbot_EET_action, \
+    _machine_EET_scores, _transbot_EET_scores
 from ray.rllib.models.preprocessors import get_preprocessor
 
 
 SOURCES = ("online", "demo", "dagger", "oracle")
 
 
-def _build_teacher_scores(action_mask, chosen_action):
-    """Return teacher scores with -inf on invalid actions.
+def _sample_pref_vec():
+    """Sample a two-dimensional preference vector for a trajectory."""
 
-    For now, valid-but-unselected actions get 0, and the selected action gets 1,
-    which works as a soft target while keeping invalid entries masked at -inf.
-    """
-
-    scores = np.full_like(action_mask, -np.inf, dtype=np.float32)
-    valid_indices = np.where(action_mask > 0)[0]
-    scores[valid_indices] = 0.0
-    if 0 <= chosen_action < scores.shape[0]:
-        scores[chosen_action] = 1.0
-    return scores
+    return np.random.dirichlet(np.ones(2)).astype(np.float32)
 
 
 def generate_sample_batch(batch_type, *, source="demo", pref_vec=None, traj_id=None):
@@ -43,7 +35,7 @@ def generate_sample_batch(batch_type, *, source="demo", pref_vec=None, traj_id=N
 
     observation, info = env.reset()
     if pref_vec is None:
-        pref_vec = np.array([0.5, 0.5], dtype=np.float32)
+        pref_vec = _sample_pref_vec()
     traj_id = traj_id or str(uuid.uuid4())
     t = 0
     done = False
@@ -57,8 +49,11 @@ def generate_sample_batch(batch_type, *, source="demo", pref_vec=None, traj_id=N
             job_prev_obs = copy.deepcopy(observation["agent0"])
             legal_job_actions = copy.deepcopy(observation["agent0"]["action_mask"])
             real_job_attrs = copy.deepcopy(observation["agent0"]["observation"])
-            FDD_MTWR_job_action = job_FDD_MTWR_action(legal_job_actions=legal_job_actions,
-                                                      real_job_attrs=real_job_attrs)
+            teacher_scores = job_FDD_MTWR_scores(legal_job_actions=legal_job_actions,
+                                                 real_job_attrs=real_job_attrs)
+            FDD_MTWR_job_action = {
+                "agent0": int(np.argmax(teacher_scores))
+            }
             observation, reward, terminated, truncated, info = env.step(FDD_MTWR_job_action)
             stage = next(iter(info["agent1"].values()), None)
             if batch_type == "job":
@@ -69,7 +64,7 @@ def generate_sample_batch(batch_type, *, source="demo", pref_vec=None, traj_id=N
                     actions=FDD_MTWR_job_action["agent0"],
                     valid_mask=action_mask,
                     pref_vec=pref_vec,
-                    teacher_scores=_build_teacher_scores(action_mask, FDD_MTWR_job_action["agent0"]),
+                    teacher_scores=teacher_scores,
                     source=source,
                     traj_id=traj_id,
                     step_id=step_id,
@@ -81,8 +76,12 @@ def generate_sample_batch(batch_type, *, source="demo", pref_vec=None, traj_id=N
             machine_prev_obs = copy.deepcopy(observation["agent1"])
             legal_machine_actions = copy.deepcopy(observation["agent1"]["action_mask"])
             real_machine_attrs = copy.deepcopy(observation["agent1"]["observation"])
+            teacher_scores = _machine_EET_scores(legal_machine_actions=legal_machine_actions,
+                                                 real_machine_attrs=real_machine_attrs,
+                                                 pref_vec=pref_vec)
             EET_machine_action = machine_EET_action(legal_machine_actions=legal_machine_actions,
-                                                    real_machine_attrs=real_machine_attrs)
+                                                    real_machine_attrs=real_machine_attrs,
+                                                    pref_vec=pref_vec)
             observation, reward, terminated, truncated, info = env.step(EET_machine_action)
             stage = next(iter(info["agent2"].values()), None)
             if batch_type == "machine":
@@ -93,7 +92,7 @@ def generate_sample_batch(batch_type, *, source="demo", pref_vec=None, traj_id=N
                     actions=EET_machine_action["agent1"],
                     valid_mask=action_mask,
                     pref_vec=pref_vec,
-                    teacher_scores=_build_teacher_scores(action_mask, EET_machine_action["agent1"]),
+                    teacher_scores=teacher_scores,
                     source=source,
                     traj_id=traj_id,
                     step_id=step_id,
@@ -104,8 +103,12 @@ def generate_sample_batch(batch_type, *, source="demo", pref_vec=None, traj_id=N
             transbot_prev_obs = copy.deepcopy(observation["agent2"])
             legal_transbot_actions = copy.deepcopy(observation["agent2"]["action_mask"])
             real_transbot_attrs = copy.deepcopy(observation["agent2"]["observation"])
+            teacher_scores = _transbot_EET_scores(legal_transbot_actions=legal_transbot_actions,
+                                                  real_transbot_attrs=real_transbot_attrs,
+                                                  pref_vec=pref_vec)
             EET_transbot_action = transbot_EET_action(legal_transbot_actions=legal_transbot_actions,
-                                                      real_transbot_attrs=real_transbot_attrs)
+                                                      real_transbot_attrs=real_transbot_attrs,
+                                                      pref_vec=pref_vec)
             observation, reward, terminated, truncated, info = env.step(EET_transbot_action)
             stage = next(iter(info["agent0"].values()), None)
             if batch_type == "transbot":
@@ -116,7 +119,7 @@ def generate_sample_batch(batch_type, *, source="demo", pref_vec=None, traj_id=N
                     actions=EET_transbot_action["agent2"],
                     valid_mask=action_mask,
                     pref_vec=pref_vec,
-                    teacher_scores=_build_teacher_scores(action_mask, EET_transbot_action["agent2"]),
+                    teacher_scores=teacher_scores,
                     source=source,
                     traj_id=traj_id,
                     step_id=step_id,

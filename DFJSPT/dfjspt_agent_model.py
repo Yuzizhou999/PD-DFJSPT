@@ -1,11 +1,9 @@
 from gymnasium.spaces import Dict, Box
 from ray.rllib.models.modelv2 import ModelV2, restore_original_dimensions
-from ray.rllib.models.torch.torch_action_dist import TorchCategorical
 from ray.rllib.utils.annotations import override
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 from ray.rllib.models.torch.fcnet import FullyConnectedNetwork as TorchFC
 from ray.rllib.utils.framework import try_import_torch
-from ray.rllib.utils.torch_utils import FLOAT_MIN
 from DFJSPT import dfjspt_params
 from DFJSPT.dfjspt_generate_a_sample_batch import (
     MultiSourceReplayBuffer,
@@ -53,18 +51,36 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
         # PD-MORL: 获取原始观测和偏好的维度
         self.obs_shape = orig_space["observation"].shape  # (MAX_JOBS, n_features)
         self.preference_dim = orig_space["preference"].shape[0]  # reward_size (通常是 2)
+
+        # PD-MORL: 计算展平后的观测维度
+        # observation 是二维的 (MAX_JOBS, n_features)，需要展平
+        self.obs_dim = 1
+        for dim in self.obs_shape:
+            self.obs_dim *= dim
+
+        hidden_dim = max(32, self.preference_dim * 16)
+        self.pref_film = nn.Sequential(
+            nn.Linear(self.preference_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, self.obs_dim * 2),
+        )
+
+        self.il_softmax_temperature_start = getattr(
+            dfjspt_params, "il_softmax_temperature_start", 1.0
+        )
+        self.il_softmax_temperature_end = getattr(
+            dfjspt_params, "il_softmax_temperature_end", 1.0
+        )
+        self.il_softmax_temperature_decay = getattr(
+            dfjspt_params, "il_softmax_temperature_decay", 1.0
+        )
+        self.il_temperature_updates = 0
         
         # PD-MORL: 为 imitation learning 保存不含偏好的原始观测空间
         self.orig_obs_space_for_il = Dict({
             "observation": orig_space["observation"],
             "action_mask": orig_space["action_mask"]
         })
-        
-        # PD-MORL: 计算展平后的观测维度
-        # observation 是二维的 (MAX_JOBS, n_features)，需要展平
-        self.obs_dim = 1
-        for dim in self.obs_shape:
-            self.obs_dim *= dim
         
         # PD-MORL: 创建组合空间（observation + preference）
         # 新的输入维度 = 展平的观测维度 + 偏好维度
@@ -104,14 +120,17 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
         # observation_flat: (batch_size, obs_dim)
         # preference: (batch_size, preference_dim)
         # combined: (batch_size, obs_dim + preference_dim)
-        combined_input = torch.cat([observation_flat, preference], dim=1)
+        film_params = self.pref_film(preference)
+        gamma, beta = torch.chunk(film_params, 2, dim=-1)
+        gamma = torch.tanh(gamma)
+        obs_modulated = observation_flat * (1 + gamma) + beta
+
+        combined_input = torch.cat([obs_modulated, preference], dim=1)
 
         # Compute the unmasked logits using the combined input
         logits, _ = self.internal_model({"obs": combined_input})
 
-        # Convert action_mask into a [0.0 || -inf]-type mask.
-        inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
-        masked_logits = logits + inf_mask
+        masked_logits = logits.masked_fill(~action_mask.bool(), -1e9)
 
         # Return masked logits.
         return masked_logits, state
@@ -140,20 +159,21 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
             logits, _ = self.forward({"obs": obs}, [], None)
 
             action_mask = torch.from_numpy(batch["valid_mask"]).to(policy_loss[0].device)
-            # Convert action_mask into a [0.0 || -inf]-type mask.
-            inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
-            logits = logits + inf_mask
+            logits = logits.masked_fill(~action_mask.bool(), -1e9)
 
-            # Compute the IL loss.
-            action_dist_1 = TorchCategorical(logits, self.model_config)
-
-            imitation_loss_1 = torch.mean(
-                -action_dist_1.logp(
-                    # torch.from_numpy(batch["actions"]).to(policy_loss[0].device)
-                    torch.from_numpy(batch["actions"]).to(policy_loss[0].device)
-                )
+            teacher_scores = torch.from_numpy(batch["teacher_scores"]).float().to(
+                policy_loss[0].device
             )
-            imitation_loss = imitation_loss_1
+            temperature = max(
+                self.il_softmax_temperature_end,
+                self.il_softmax_temperature_start
+                * (self.il_softmax_temperature_decay ** self.il_temperature_updates),
+            )
+            self.il_temperature_updates += 1
+            teacher_probs = torch.softmax(teacher_scores / temperature, dim=1)
+
+            log_probs = torch.log_softmax(logits, dim=1)
+            imitation_loss = -(teacher_probs * log_probs).sum(dim=1).mean()
             # self.imitation_loss_metric = imitation_loss.item()
             # self.policy_loss_metric = np.mean([loss.item() for loss in policy_loss])
 
@@ -201,17 +221,35 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
         # PD-MORL: 获取原始观测和偏好的维度
         self.obs_shape = orig_space["observation"].shape  # (MAX_MACHINES, n_features)
         self.preference_dim = orig_space["preference"].shape[0]  # reward_size
+
+        # PD-MORL: 计算展平后的观测维度
+        self.obs_dim = 1
+        for dim in self.obs_shape:
+            self.obs_dim *= dim
+
+        hidden_dim = max(32, self.preference_dim * 16)
+        self.pref_film = nn.Sequential(
+            nn.Linear(self.preference_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, self.obs_dim * 2),
+        )
+
+        self.il_softmax_temperature_start = getattr(
+            dfjspt_params, "il_softmax_temperature_start", 1.0
+        )
+        self.il_softmax_temperature_end = getattr(
+            dfjspt_params, "il_softmax_temperature_end", 1.0
+        )
+        self.il_softmax_temperature_decay = getattr(
+            dfjspt_params, "il_softmax_temperature_decay", 1.0
+        )
+        self.il_temperature_updates = 0
         
         # PD-MORL: 为 imitation learning 保存不含偏好的原始观测空间
         self.orig_obs_space_for_il = Dict({
             "observation": orig_space["observation"],
             "action_mask": orig_space["action_mask"]
         })
-        
-        # PD-MORL: 计算展平后的观测维度
-        self.obs_dim = 1
-        for dim in self.obs_shape:
-            self.obs_dim *= dim
         
         # PD-MORL: 创建组合空间（observation + preference）
         combined_dim = self.obs_dim + self.preference_dim
@@ -245,14 +283,17 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
         observation_flat = observation.reshape(batch_size, -1)
         
         # PD-MORL: 拼接观测和偏好
-        combined_input = torch.cat([observation_flat, preference], dim=1)
+        film_params = self.pref_film(preference)
+        gamma, beta = torch.chunk(film_params, 2, dim=-1)
+        gamma = torch.tanh(gamma)
+        obs_modulated = observation_flat * (1 + gamma) + beta
+
+        combined_input = torch.cat([obs_modulated, preference], dim=1)
 
         # Compute the unmasked logits.
         logits, _ = self.internal_model({"obs": combined_input})
 
-        # Convert action_mask into a [0.0 || -inf]-type mask.
-        inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
-        masked_logits = logits + inf_mask
+        masked_logits = logits.masked_fill(~action_mask.bool(), -1e9)
 
         # Return masked logits.
         return masked_logits, state
@@ -279,20 +320,21 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
 
             logits, _ = self.forward({"obs": obs}, [], None)
             action_mask = torch.from_numpy(batch["valid_mask"]).to(policy_loss[0].device)
-            # Convert action_mask into a [0.0 || -inf]-type mask.
-            inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
-            logits = logits + inf_mask
+            logits = logits.masked_fill(~action_mask.bool(), -1e9)
 
-            # Compute the IL loss.
-            action_dist_1 = TorchCategorical(logits, self.model_config)
-
-            imitation_loss_1 = torch.mean(
-                -action_dist_1.logp(
-                    # torch.from_numpy(batch["actions"]).to(policy_loss[0].device)
-                    torch.from_numpy(batch["actions"]).to(policy_loss[0].device)
-                )
+            teacher_scores = torch.from_numpy(batch["teacher_scores"]).float().to(
+                policy_loss[0].device
             )
-            imitation_loss = imitation_loss_1
+            temperature = max(
+                self.il_softmax_temperature_end,
+                self.il_softmax_temperature_start
+                * (self.il_softmax_temperature_decay ** self.il_temperature_updates),
+            )
+            self.il_temperature_updates += 1
+            teacher_probs = torch.softmax(teacher_scores / temperature, dim=1)
+
+            log_probs = torch.log_softmax(logits, dim=1)
+            imitation_loss = -(teacher_probs * log_probs).sum(dim=1).mean()
             # self.imitation_loss_metric = imitation_loss.item()
             # self.policy_loss_metric = np.mean([loss.item() for loss in policy_loss])
 
@@ -336,18 +378,36 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
         # PD-MORL: 获取原始观测和偏好的维度
         self.obs_shape = orig_space["observation"].shape  # (MAX_TRANSBOTS, n_features)
         self.preference_dim = orig_space["preference"].shape[0]  # reward_size
-        
+
+        # PD-MORL: 计算展平后的观测维度
+        self.obs_dim = 1
+        for dim in self.obs_shape:
+            self.obs_dim *= dim
+
+        hidden_dim = max(32, self.preference_dim * 16)
+        self.pref_film = nn.Sequential(
+            nn.Linear(self.preference_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, self.obs_dim * 2),
+        )
+
+        self.il_softmax_temperature_start = getattr(
+            dfjspt_params, "il_softmax_temperature_start", 1.0
+        )
+        self.il_softmax_temperature_end = getattr(
+            dfjspt_params, "il_softmax_temperature_end", 1.0
+        )
+        self.il_softmax_temperature_decay = getattr(
+            dfjspt_params, "il_softmax_temperature_decay", 1.0
+        )
+        self.il_temperature_updates = 0
+
         # PD-MORL: 为 imitation learning 保存不含偏好的原始观测空间
         self.orig_obs_space_for_il = Dict({
             "observation": orig_space["observation"],
             "action_mask": orig_space["action_mask"]
         })
-        
-        # PD-MORL: 计算展平后的观测维度
-        self.obs_dim = 1
-        for dim in self.obs_shape:
-            self.obs_dim *= dim
-        
+
         # PD-MORL: 创建组合空间（observation + preference）
         combined_dim = self.obs_dim + self.preference_dim
         
@@ -380,14 +440,17 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
         observation_flat = observation.reshape(batch_size, -1)
         
         # PD-MORL: 拼接观测和偏好
-        combined_input = torch.cat([observation_flat, preference], dim=1)
+        film_params = self.pref_film(preference)
+        gamma, beta = torch.chunk(film_params, 2, dim=-1)
+        gamma = torch.tanh(gamma)
+        obs_modulated = observation_flat * (1 + gamma) + beta
+
+        combined_input = torch.cat([obs_modulated, preference], dim=1)
 
         # Compute the unmasked logits.
         logits, _ = self.internal_model({"obs": combined_input})
 
-        # Convert action_mask into a [0.0 || -inf]-type mask.
-        inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
-        masked_logits = logits + inf_mask
+        masked_logits = logits.masked_fill(~action_mask.bool(), -1e9)
 
         # Return masked logits.
         return masked_logits, state
@@ -415,19 +478,21 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
 
             logits, _ = self.forward({"obs": obs}, [], None)
             action_mask = torch.from_numpy(batch["valid_mask"]).to(policy_loss[0].device)
-            # Convert action_mask into a [0.0 || -inf]-type mask.
-            inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
-            logits = logits + inf_mask
+            logits = logits.masked_fill(~action_mask.bool(), -1e9)
 
-            # Compute the IL loss.
-            action_dist = TorchCategorical(logits, self.model_config)
-
-            imitation_loss = torch.mean(
-                -action_dist.logp(
-                    # torch.from_numpy(batch["actions"]).to(policy_loss[0].device)
-                    torch.from_numpy(batch["actions"]).to(policy_loss[0].device)
-                )
+            teacher_scores = torch.from_numpy(batch["teacher_scores"]).float().to(
+                policy_loss[0].device
             )
+            temperature = max(
+                self.il_softmax_temperature_end,
+                self.il_softmax_temperature_start
+                * (self.il_softmax_temperature_decay ** self.il_temperature_updates),
+            )
+            self.il_temperature_updates += 1
+            teacher_probs = torch.softmax(teacher_scores / temperature, dim=1)
+
+            log_probs = torch.log_softmax(logits, dim=1)
+            imitation_loss = -(teacher_probs * log_probs).sum(dim=1).mean()
             # self.imitation_loss_metric = imitation_loss.item()
             # self.policy_loss_metric = np.mean([loss.item() for loss in policy_loss])
 

@@ -75,6 +75,8 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
             dfjspt_params, "il_softmax_temperature_decay", 1.0
         )
         self.il_temperature_updates = 0
+        self.last_qfilter_ratio = 1.0
+        self.last_teacher_policy_kl = 0.0
         
         # PD-MORL: 为 imitation learning 保存不含偏好的原始观测空间
         self.orig_obs_space_for_il = Dict({
@@ -211,6 +213,10 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
             il_loss = combined_il.mean()
 
             teacher_policy_kl = (teacher_probs * (torch.log(teacher_probs + 1e-8) - log_probs)).sum(dim=1)
+            self.last_teacher_policy_kl = teacher_policy_kl.detach().mean().item()
+            self.last_qfilter_ratio = (
+                good_mask.mean().item() if getattr(dfjspt_params, "il_use_qfilter", True) else 1.0
+            )
             adapt_lambda = dfjspt_params.il_loss_weight / (1.0 + teacher_policy_kl.detach().mean())
 
             return [loss_ + adapt_lambda * il_loss for loss_ in policy_loss]
@@ -277,7 +283,9 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
             dfjspt_params, "il_softmax_temperature_decay", 1.0
         )
         self.il_temperature_updates = 0
-        
+        self.last_qfilter_ratio = 1.0
+        self.last_teacher_policy_kl = 0.0
+
         # PD-MORL: 为 imitation learning 保存不含偏好的原始观测空间
         self.orig_obs_space_for_il = Dict({
             "observation": orig_space["observation"],
@@ -405,6 +413,10 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
             il_loss = combined_il.mean()
 
             teacher_policy_kl = (teacher_probs * (torch.log(teacher_probs + 1e-8) - log_probs)).sum(dim=1)
+            self.last_teacher_policy_kl = teacher_policy_kl.detach().mean().item()
+            self.last_qfilter_ratio = (
+                good_mask.mean().item() if getattr(dfjspt_params, "il_use_qfilter", True) else 1.0
+            )
             adapt_lambda = dfjspt_params.il_loss_weight / (1.0 + teacher_policy_kl.detach().mean())
 
             return [loss_ + adapt_lambda * il_loss for loss_ in policy_loss]
@@ -467,6 +479,8 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
             dfjspt_params, "il_softmax_temperature_decay", 1.0
         )
         self.il_temperature_updates = 0
+        self.last_qfilter_ratio = 1.0
+        self.last_teacher_policy_kl = 0.0
 
         # PD-MORL: 为 imitation learning 保存不含偏好的原始观测空间
         self.orig_obs_space_for_il = Dict({
@@ -596,6 +610,10 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
             il_loss = combined_il.mean()
 
             teacher_policy_kl = (teacher_probs * (torch.log(teacher_probs + 1e-8) - log_probs)).sum(dim=1)
+            self.last_teacher_policy_kl = teacher_policy_kl.detach().mean().item()
+            self.last_qfilter_ratio = (
+                good_mask.mean().item() if getattr(dfjspt_params, "il_use_qfilter", True) else 1.0
+            )
             adapt_lambda = dfjspt_params.il_loss_weight / (1.0 + teacher_policy_kl.detach().mean())
 
             return [loss_ + adapt_lambda * il_loss for loss_ in policy_loss]

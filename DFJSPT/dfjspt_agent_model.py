@@ -164,6 +164,9 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
             teacher_scores = torch.from_numpy(batch["teacher_scores"]).float().to(
                 policy_loss[0].device
             )
+            teacher_scores = teacher_scores.masked_fill(~action_mask.bool(), -1e9)
+            actions_demo = torch.from_numpy(batch["actions"]).long().to(policy_loss[0].device)
+
             temperature = max(
                 self.il_softmax_temperature_end,
                 self.il_softmax_temperature_start
@@ -173,14 +176,44 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
             teacher_probs = torch.softmax(teacher_scores / temperature, dim=1)
 
             log_probs = torch.log_softmax(logits, dim=1)
-            imitation_loss = -(teacher_probs * log_probs).sum(dim=1).mean()
-            # self.imitation_loss_metric = imitation_loss.item()
-            # self.policy_loss_metric = np.mean([loss.item() for loss in policy_loss])
+            il_loss_soft = -(teacher_probs * log_probs).sum(dim=1)
 
-            # Add the imitation loss to each already calculated policy loss term.
-            # Alternatively (if custom loss has its own optimizer):
-            # return policy_loss + [10 * self.imitation_loss]
-            return [loss_ + dfjspt_params.il_loss_weight * imitation_loss for loss_ in policy_loss]
+            pi = torch.distributions.Categorical(logits=logits)
+            scores_valid = torch.where(action_mask.bool(), teacher_scores, torch.zeros_like(teacher_scores))
+            with torch.no_grad():
+                pi_probs = pi.probs
+                v_s = (pi_probs * scores_valid).sum(dim=1)
+                q_sa_demo = scores_valid.gather(1, actions_demo.unsqueeze(-1)).squeeze(-1)
+                q_sa_pi = (pi_probs * scores_valid).sum(dim=1)
+                advantages = q_sa_demo - v_s
+                weights = torch.exp(
+                    torch.clamp(
+                        advantages
+                        / getattr(dfjspt_params, "il_awac_beta", 1.0),
+                        min=-getattr(dfjspt_params, "il_awac_clip", 5.0),
+                        max=getattr(dfjspt_params, "il_awac_clip", 5.0),
+                    )
+                )
+                good_mask = (
+                    q_sa_demo
+                    >= q_sa_pi + getattr(dfjspt_params, "il_qfilter_delta", 0.0)
+                ).float()
+
+            il_loss_aw = -(weights * pi.log_prob(actions_demo))
+            combined_il = (
+                getattr(dfjspt_params, "il_alpha_soft", 1.0) * il_loss_soft
+                + getattr(dfjspt_params, "il_alpha_aw", 1.0) * il_loss_aw
+            )
+
+            if getattr(dfjspt_params, "il_use_qfilter", True):
+                combined_il = combined_il * good_mask
+
+            il_loss = combined_il.mean()
+
+            teacher_policy_kl = (teacher_probs * (torch.log(teacher_probs + 1e-8) - log_probs)).sum(dim=1)
+            adapt_lambda = dfjspt_params.il_loss_weight / (1.0 + teacher_policy_kl.detach().mean())
+
+            return [loss_ + adapt_lambda * il_loss for loss_ in policy_loss]
         elif dfjspt_params.use_custom_loss is False:
             return policy_loss
         else:
@@ -325,6 +358,9 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
             teacher_scores = torch.from_numpy(batch["teacher_scores"]).float().to(
                 policy_loss[0].device
             )
+            teacher_scores = teacher_scores.masked_fill(~action_mask.bool(), -1e9)
+            actions_demo = torch.from_numpy(batch["actions"]).long().to(policy_loss[0].device)
+
             temperature = max(
                 self.il_softmax_temperature_end,
                 self.il_softmax_temperature_start
@@ -334,14 +370,44 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
             teacher_probs = torch.softmax(teacher_scores / temperature, dim=1)
 
             log_probs = torch.log_softmax(logits, dim=1)
-            imitation_loss = -(teacher_probs * log_probs).sum(dim=1).mean()
-            # self.imitation_loss_metric = imitation_loss.item()
-            # self.policy_loss_metric = np.mean([loss.item() for loss in policy_loss])
+            il_loss_soft = -(teacher_probs * log_probs).sum(dim=1)
 
-            # Add the imitation loss to each already calculated policy loss term.
-            # Alternatively (if custom loss has its own optimizer):
-            # return policy_loss + [10 * self.imitation_loss]
-            return [loss_ + dfjspt_params.il_loss_weight * imitation_loss for loss_ in policy_loss]
+            pi = torch.distributions.Categorical(logits=logits)
+            scores_valid = torch.where(action_mask.bool(), teacher_scores, torch.zeros_like(teacher_scores))
+            with torch.no_grad():
+                pi_probs = pi.probs
+                v_s = (pi_probs * scores_valid).sum(dim=1)
+                q_sa_demo = scores_valid.gather(1, actions_demo.unsqueeze(-1)).squeeze(-1)
+                q_sa_pi = (pi_probs * scores_valid).sum(dim=1)
+                advantages = q_sa_demo - v_s
+                weights = torch.exp(
+                    torch.clamp(
+                        advantages
+                        / getattr(dfjspt_params, "il_awac_beta", 1.0),
+                        min=-getattr(dfjspt_params, "il_awac_clip", 5.0),
+                        max=getattr(dfjspt_params, "il_awac_clip", 5.0),
+                    )
+                )
+                good_mask = (
+                    q_sa_demo
+                    >= q_sa_pi + getattr(dfjspt_params, "il_qfilter_delta", 0.0)
+                ).float()
+
+            il_loss_aw = -(weights * pi.log_prob(actions_demo))
+            combined_il = (
+                getattr(dfjspt_params, "il_alpha_soft", 1.0) * il_loss_soft
+                + getattr(dfjspt_params, "il_alpha_aw", 1.0) * il_loss_aw
+            )
+
+            if getattr(dfjspt_params, "il_use_qfilter", True):
+                combined_il = combined_il * good_mask
+
+            il_loss = combined_il.mean()
+
+            teacher_policy_kl = (teacher_probs * (torch.log(teacher_probs + 1e-8) - log_probs)).sum(dim=1)
+            adapt_lambda = dfjspt_params.il_loss_weight / (1.0 + teacher_policy_kl.detach().mean())
+
+            return [loss_ + adapt_lambda * il_loss for loss_ in policy_loss]
         else:
             return policy_loss
 
@@ -483,6 +549,9 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
             teacher_scores = torch.from_numpy(batch["teacher_scores"]).float().to(
                 policy_loss[0].device
             )
+            teacher_scores = teacher_scores.masked_fill(~action_mask.bool(), -1e9)
+            actions_demo = torch.from_numpy(batch["actions"]).long().to(policy_loss[0].device)
+
             temperature = max(
                 self.il_softmax_temperature_end,
                 self.il_softmax_temperature_start
@@ -492,14 +561,44 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
             teacher_probs = torch.softmax(teacher_scores / temperature, dim=1)
 
             log_probs = torch.log_softmax(logits, dim=1)
-            imitation_loss = -(teacher_probs * log_probs).sum(dim=1).mean()
-            # self.imitation_loss_metric = imitation_loss.item()
-            # self.policy_loss_metric = np.mean([loss.item() for loss in policy_loss])
+            il_loss_soft = -(teacher_probs * log_probs).sum(dim=1)
 
-            # Add the imitation loss to each already calculated policy loss term.
-            # Alternatively (if custom loss has its own optimizer):
-            # return policy_loss + [10 * self.imitation_loss]
-            return [loss_ + dfjspt_params.il_loss_weight * imitation_loss for loss_ in policy_loss]
+            pi = torch.distributions.Categorical(logits=logits)
+            scores_valid = torch.where(action_mask.bool(), teacher_scores, torch.zeros_like(teacher_scores))
+            with torch.no_grad():
+                pi_probs = pi.probs
+                v_s = (pi_probs * scores_valid).sum(dim=1)
+                q_sa_demo = scores_valid.gather(1, actions_demo.unsqueeze(-1)).squeeze(-1)
+                q_sa_pi = (pi_probs * scores_valid).sum(dim=1)
+                advantages = q_sa_demo - v_s
+                weights = torch.exp(
+                    torch.clamp(
+                        advantages
+                        / getattr(dfjspt_params, "il_awac_beta", 1.0),
+                        min=-getattr(dfjspt_params, "il_awac_clip", 5.0),
+                        max=getattr(dfjspt_params, "il_awac_clip", 5.0),
+                    )
+                )
+                good_mask = (
+                    q_sa_demo
+                    >= q_sa_pi + getattr(dfjspt_params, "il_qfilter_delta", 0.0)
+                ).float()
+
+            il_loss_aw = -(weights * pi.log_prob(actions_demo))
+            combined_il = (
+                getattr(dfjspt_params, "il_alpha_soft", 1.0) * il_loss_soft
+                + getattr(dfjspt_params, "il_alpha_aw", 1.0) * il_loss_aw
+            )
+
+            if getattr(dfjspt_params, "il_use_qfilter", True):
+                combined_il = combined_il * good_mask
+
+            il_loss = combined_il.mean()
+
+            teacher_policy_kl = (teacher_probs * (torch.log(teacher_probs + 1e-8) - log_probs)).sum(dim=1)
+            adapt_lambda = dfjspt_params.il_loss_weight / (1.0 + teacher_policy_kl.detach().mean())
+
+            return [loss_ + adapt_lambda * il_loss for loss_ in policy_loss]
         elif dfjspt_params.use_custom_loss is False:
             return policy_loss
         else:

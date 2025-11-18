@@ -7,9 +7,17 @@ from ray.rllib.models.torch.fcnet import FullyConnectedNetwork as TorchFC
 from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.utils.torch_utils import FLOAT_MIN
 from DFJSPT import dfjspt_params
-from DFJSPT.dfjspt_generate_a_sample_batch import generate_sample_batch
+from DFJSPT.dfjspt_generate_a_sample_batch import (
+    MultiSourceReplayBuffer,
+    generate_sample_batch,
+)
 
 torch, nn = try_import_torch()
+
+
+JOB_REPLAY = MultiSourceReplayBuffer("job")
+MACHINE_REPLAY = MultiSourceReplayBuffer("machine")
+TRANSBOT_REPLAY = MultiSourceReplayBuffer("transbot")
 
 
 class JobActionMaskModel(TorchModelV2, nn.Module):
@@ -115,8 +123,8 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
     @override(ModelV2)
     def custom_loss(self, policy_loss, loss_inputs=None):
         if dfjspt_params.use_custom_loss is True:
-            # Get the next batch from our input files.
-            batch = generate_sample_batch(batch_type="job")
+            # Sample a mixed batch from the replay pools.
+            batch = JOB_REPLAY.sample()
 
             # PD-MORL: 使用不含偏好的原始观测空间进行维度还原
             obs = restore_original_dimensions(
@@ -124,16 +132,14 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
                 self.orig_obs_space_for_il,  # 使用不含偏好的空间
                 tensorlib="torch",
             )
-            
-            # PD-MORL: 为 imitation learning 添加虚拟偏好向量（全零）
-            # 因为 IL 数据不包含偏好，我们使用中性偏好 [0.5, 0.5]
-            batch_size = obs["observation"].shape[0]
-            dummy_preference = torch.ones(batch_size, self.preference_dim, device=policy_loss[0].device) * 0.5
-            obs["preference"] = dummy_preference
-            
+
+            # 使用轨迹自带的偏好向量，保证同一 traj_id 的偏好一致
+            pref_tensor = torch.from_numpy(batch["pref_vec"]).float().to(policy_loss[0].device)
+            obs["preference"] = pref_tensor
+
             logits, _ = self.forward({"obs": obs}, [], None)
 
-            action_mask = obs["action_mask"]
+            action_mask = torch.from_numpy(batch["valid_mask"]).to(policy_loss[0].device)
             # Convert action_mask into a [0.0 || -inf]-type mask.
             inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
             logits = logits + inf_mask
@@ -159,6 +165,7 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
             return policy_loss
         else:
             raise RuntimeError('Invalid "use_custom_loss" value!')
+
 
 
 class MachineActionMaskModel(TorchModelV2, nn.Module):
@@ -256,8 +263,8 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
     @override(ModelV2)
     def custom_loss(self, policy_loss, loss_inputs=None):
         if dfjspt_params.use_custom_loss is True:
-            # Get the next batch from our input files.
-            batch = generate_sample_batch(batch_type="machine")
+            # Sample a mixed batch from the replay pools.
+            batch = MACHINE_REPLAY.sample()
 
             # PD-MORL: 使用不含偏好的原始观测空间进行维度还原
             obs = restore_original_dimensions(
@@ -266,13 +273,12 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
                 tensorlib="torch",
             )
             
-            # PD-MORL: 为 imitation learning 添加虚拟偏好向量（全零）
-            batch_size = obs["observation"].shape[0]
-            dummy_preference = torch.ones(batch_size, self.preference_dim, device=policy_loss[0].device) * 0.5
-            obs["preference"] = dummy_preference
-            
+            # 使用轨迹自带的偏好向量，保证同一 traj_id 的偏好一致
+            pref_tensor = torch.from_numpy(batch["pref_vec"]).float().to(policy_loss[0].device)
+            obs["preference"] = pref_tensor
+
             logits, _ = self.forward({"obs": obs}, [], None)
-            action_mask = obs["action_mask"]
+            action_mask = torch.from_numpy(batch["valid_mask"]).to(policy_loss[0].device)
             # Convert action_mask into a [0.0 || -inf]-type mask.
             inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
             logits = logits + inf_mask
@@ -393,8 +399,8 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
     @override(ModelV2)
     def custom_loss(self, policy_loss, loss_inputs=None):
         if dfjspt_params.use_custom_loss is True:
-            # Get the next batch from our input files.
-            batch = generate_sample_batch(batch_type="transbot")
+            # Sample a mixed batch from the replay pools.
+            batch = TRANSBOT_REPLAY.sample()
 
             # PD-MORL: 使用不含偏好的原始观测空间进行维度还原
             obs = restore_original_dimensions(
@@ -403,13 +409,12 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
                 tensorlib="torch",
             )
             
-            # PD-MORL: 为 imitation learning 添加虚拟偏好向量（全零）
-            batch_size = obs["observation"].shape[0]
-            dummy_preference = torch.ones(batch_size, self.preference_dim, device=policy_loss[0].device) * 0.5
-            obs["preference"] = dummy_preference
-            
+            # 使用轨迹自带的偏好向量，保证同一 traj_id 的偏好一致
+            pref_tensor = torch.from_numpy(batch["pref_vec"]).float().to(policy_loss[0].device)
+            obs["preference"] = pref_tensor
+
             logits, _ = self.forward({"obs": obs}, [], None)
-            action_mask = obs["action_mask"]
+            action_mask = torch.from_numpy(batch["valid_mask"]).to(policy_loss[0].device)
             # Convert action_mask into a [0.0 || -inf]-type mask.
             inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
             logits = logits + inf_mask

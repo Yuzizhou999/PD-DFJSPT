@@ -398,17 +398,20 @@ class MyTrainable(tune.Trainable):
             for agent in ["agent0", "agent1", "agent2"]
         }
         self.dagger_interval_multiplier = 1.0
-        self.dagger_latest_labels = 0
+        self.dagger_latest_labels = {"total": 0, "job": 0, "machine": 0, "transbot": 0}
 
     def step(self):
         actual_interval = max(1, int(dfjspt_params.dagger_label_interval * self.dagger_interval_multiplier))
         if self.epoch % actual_interval == 0:
             self.dagger_latest_labels = self._collect_dagger_data()
         else:
-            self.dagger_latest_labels = 0
+            self.dagger_latest_labels = {"total": 0, "job": 0, "machine": 0, "transbot": 0}
 
         result = self.agent1.train()
-        result["dagger_labels"] = self.dagger_latest_labels
+        result["dagger_labels"] = self.dagger_latest_labels.get("total", 0)
+        result["dagger_labels_job"] = self.dagger_latest_labels.get("job", 0)
+        result["dagger_labels_machine"] = self.dagger_latest_labels.get("machine", 0)
+        result["dagger_labels_transbot"] = self.dagger_latest_labels.get("transbot", 0)
         self._update_dagger_schedule()
         if result["custom_metrics"]["total_makespan_mean"] <= result["custom_metrics"]["instance_rule_makespan_mean"] - 100:
             dfjspt_params.use_custom_loss = False
@@ -548,7 +551,7 @@ class MyTrainable(tune.Trainable):
             step_id=step_id,
         )
 
-    def _collect_dagger_data(self) -> int:
+    def _collect_dagger_data(self) -> Dict[str, int]:
         job_builder = SampleBatchBuilder()
         machine_builder = SampleBatchBuilder()
         transbot_builder = SampleBatchBuilder()
@@ -603,14 +606,23 @@ class MyTrainable(tune.Trainable):
             if terminated.get("__all__") or truncated.get("__all__"):
                 break
 
-        if job_builder.count > 0:
+        job_labels = job_builder.count
+        machine_labels = machine_builder.count
+        transbot_labels = transbot_builder.count
+
+        if job_labels > 0:
             JOB_REPLAY.add_batch(job_builder.build_and_reset())
-        if machine_builder.count > 0:
+        if machine_labels > 0:
             MACHINE_REPLAY.add_batch(machine_builder.build_and_reset())
-        if transbot_builder.count > 0:
+        if transbot_labels > 0:
             TRANSBOT_REPLAY.add_batch(transbot_builder.build_and_reset())
 
-        return labels_added
+        return {
+            "total": job_labels + machine_labels + transbot_labels,
+            "job": job_labels,
+            "machine": machine_labels,
+            "transbot": transbot_labels,
+        }
 
     def save_checkpoint(self, tmp_checkpoint_dir):
         self.agent1.save(tmp_checkpoint_dir)

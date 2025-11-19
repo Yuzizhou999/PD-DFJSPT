@@ -1,15 +1,21 @@
 from gymnasium.spaces import Dict, Box
 from ray.rllib.models.modelv2 import ModelV2, restore_original_dimensions
-from ray.rllib.models.torch.torch_action_dist import TorchCategorical
 from ray.rllib.utils.annotations import override
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 from ray.rllib.models.torch.fcnet import FullyConnectedNetwork as TorchFC
 from ray.rllib.utils.framework import try_import_torch
-from ray.rllib.utils.torch_utils import FLOAT_MIN
 from DFJSPT import dfjspt_params
-from DFJSPT.dfjspt_generate_a_sample_batch import generate_sample_batch
+from DFJSPT.dfjspt_generate_a_sample_batch import (
+    MultiSourceReplayBuffer,
+    generate_sample_batch,
+)
 
 torch, nn = try_import_torch()
+
+
+JOB_REPLAY = MultiSourceReplayBuffer("job")
+MACHINE_REPLAY = MultiSourceReplayBuffer("machine")
+TRANSBOT_REPLAY = MultiSourceReplayBuffer("transbot")
 
 
 class JobActionMaskModel(TorchModelV2, nn.Module):
@@ -45,18 +51,38 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
         # PD-MORL: 获取原始观测和偏好的维度
         self.obs_shape = orig_space["observation"].shape  # (MAX_JOBS, n_features)
         self.preference_dim = orig_space["preference"].shape[0]  # reward_size (通常是 2)
+
+        # PD-MORL: 计算展平后的观测维度
+        # observation 是二维的 (MAX_JOBS, n_features)，需要展平
+        self.obs_dim = 1
+        for dim in self.obs_shape:
+            self.obs_dim *= dim
+
+        hidden_dim = max(32, self.preference_dim * 16)
+        self.pref_film = nn.Sequential(
+            nn.Linear(self.preference_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, self.obs_dim * 2),
+        )
+
+        self.il_softmax_temperature_start = getattr(
+            dfjspt_params, "il_softmax_temperature_start", 1.0
+        )
+        self.il_softmax_temperature_end = getattr(
+            dfjspt_params, "il_softmax_temperature_end", 1.0
+        )
+        self.il_softmax_temperature_decay = getattr(
+            dfjspt_params, "il_softmax_temperature_decay", 1.0
+        )
+        self.il_temperature_updates = 0
+        self.last_qfilter_ratio = 1.0
+        self.last_teacher_policy_kl = 0.0
         
         # PD-MORL: 为 imitation learning 保存不含偏好的原始观测空间
         self.orig_obs_space_for_il = Dict({
             "observation": orig_space["observation"],
             "action_mask": orig_space["action_mask"]
         })
-        
-        # PD-MORL: 计算展平后的观测维度
-        # observation 是二维的 (MAX_JOBS, n_features)，需要展平
-        self.obs_dim = 1
-        for dim in self.obs_shape:
-            self.obs_dim *= dim
         
         # PD-MORL: 创建组合空间（observation + preference）
         # 新的输入维度 = 展平的观测维度 + 偏好维度
@@ -96,14 +122,17 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
         # observation_flat: (batch_size, obs_dim)
         # preference: (batch_size, preference_dim)
         # combined: (batch_size, obs_dim + preference_dim)
-        combined_input = torch.cat([observation_flat, preference], dim=1)
+        film_params = self.pref_film(preference)
+        gamma, beta = torch.chunk(film_params, 2, dim=-1)
+        gamma = torch.tanh(gamma)
+        obs_modulated = observation_flat * (1 + gamma) + beta
+
+        combined_input = torch.cat([obs_modulated, preference], dim=1)
 
         # Compute the unmasked logits using the combined input
         logits, _ = self.internal_model({"obs": combined_input})
 
-        # Convert action_mask into a [0.0 || -inf]-type mask.
-        inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
-        masked_logits = logits + inf_mask
+        masked_logits = logits.masked_fill(~action_mask.bool(), -1e9)
 
         # Return masked logits.
         return masked_logits, state
@@ -115,8 +144,8 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
     @override(ModelV2)
     def custom_loss(self, policy_loss, loss_inputs=None):
         if dfjspt_params.use_custom_loss is True:
-            # Get the next batch from our input files.
-            batch = generate_sample_batch(batch_type="job")
+            # Sample a mixed batch from the replay pools.
+            batch = JOB_REPLAY.sample()
 
             # PD-MORL: 使用不含偏好的原始观测空间进行维度还原
             obs = restore_original_dimensions(
@@ -124,41 +153,78 @@ class JobActionMaskModel(TorchModelV2, nn.Module):
                 self.orig_obs_space_for_il,  # 使用不含偏好的空间
                 tensorlib="torch",
             )
-            
-            # PD-MORL: 为 imitation learning 添加虚拟偏好向量（全零）
-            # 因为 IL 数据不包含偏好，我们使用中性偏好 [0.5, 0.5]
-            batch_size = obs["observation"].shape[0]
-            dummy_preference = torch.ones(batch_size, self.preference_dim, device=policy_loss[0].device) * 0.5
-            obs["preference"] = dummy_preference
-            
+
+            # 使用轨迹自带的偏好向量，保证同一 traj_id 的偏好一致
+            pref_tensor = torch.from_numpy(batch["pref_vec"]).float().to(policy_loss[0].device)
+            obs["preference"] = pref_tensor
+
             logits, _ = self.forward({"obs": obs}, [], None)
 
-            action_mask = obs["action_mask"]
-            # Convert action_mask into a [0.0 || -inf]-type mask.
-            inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
-            logits = logits + inf_mask
+            action_mask = torch.from_numpy(batch["valid_mask"]).to(policy_loss[0].device)
+            logits = logits.masked_fill(~action_mask.bool(), -1e9)
 
-            # Compute the IL loss.
-            action_dist_1 = TorchCategorical(logits, self.model_config)
-
-            imitation_loss_1 = torch.mean(
-                -action_dist_1.logp(
-                    # torch.from_numpy(batch["actions"]).to(policy_loss[0].device)
-                    torch.from_numpy(batch["actions"]).to(policy_loss[0].device)
-                )
+            teacher_scores = torch.from_numpy(batch["teacher_scores"]).float().to(
+                policy_loss[0].device
             )
-            imitation_loss = imitation_loss_1
-            # self.imitation_loss_metric = imitation_loss.item()
-            # self.policy_loss_metric = np.mean([loss.item() for loss in policy_loss])
+            teacher_scores = teacher_scores.masked_fill(~action_mask.bool(), -1e9)
+            actions_demo = torch.from_numpy(batch["actions"]).long().to(policy_loss[0].device)
 
-            # Add the imitation loss to each already calculated policy loss term.
-            # Alternatively (if custom loss has its own optimizer):
-            # return policy_loss + [10 * self.imitation_loss]
-            return [loss_ + dfjspt_params.il_loss_weight * imitation_loss for loss_ in policy_loss]
+            temperature = max(
+                self.il_softmax_temperature_end,
+                self.il_softmax_temperature_start
+                * (self.il_softmax_temperature_decay ** self.il_temperature_updates),
+            )
+            self.il_temperature_updates += 1
+            teacher_probs = torch.softmax(teacher_scores / temperature, dim=1)
+
+            log_probs = torch.log_softmax(logits, dim=1)
+            il_loss_soft = -(teacher_probs * log_probs).sum(dim=1)
+
+            pi = torch.distributions.Categorical(logits=logits)
+            scores_valid = torch.where(action_mask.bool(), teacher_scores, torch.zeros_like(teacher_scores))
+            with torch.no_grad():
+                pi_probs = pi.probs
+                v_s = (pi_probs * scores_valid).sum(dim=1)
+                q_sa_demo = scores_valid.gather(1, actions_demo.unsqueeze(-1)).squeeze(-1)
+                q_sa_pi = (pi_probs * scores_valid).sum(dim=1)
+                advantages = q_sa_demo - v_s
+                weights = torch.exp(
+                    torch.clamp(
+                        advantages
+                        / getattr(dfjspt_params, "il_awac_beta", 1.0),
+                        min=-getattr(dfjspt_params, "il_awac_clip", 5.0),
+                        max=getattr(dfjspt_params, "il_awac_clip", 5.0),
+                    )
+                )
+                good_mask = (
+                    q_sa_demo
+                    >= q_sa_pi + getattr(dfjspt_params, "il_qfilter_delta", 0.0)
+                ).float()
+
+            il_loss_aw = -(weights * pi.log_prob(actions_demo))
+            combined_il = (
+                getattr(dfjspt_params, "il_alpha_soft", 1.0) * il_loss_soft
+                + getattr(dfjspt_params, "il_alpha_aw", 1.0) * il_loss_aw
+            )
+
+            if getattr(dfjspt_params, "il_use_qfilter", True):
+                combined_il = combined_il * good_mask
+
+            il_loss = combined_il.mean()
+
+            teacher_policy_kl = (teacher_probs * (torch.log(teacher_probs + 1e-8) - log_probs)).sum(dim=1)
+            self.last_teacher_policy_kl = teacher_policy_kl.detach().mean().item()
+            self.last_qfilter_ratio = (
+                good_mask.mean().item() if getattr(dfjspt_params, "il_use_qfilter", True) else 1.0
+            )
+            adapt_lambda = dfjspt_params.il_loss_weight / (1.0 + teacher_policy_kl.detach().mean())
+
+            return [loss_ + adapt_lambda * il_loss for loss_ in policy_loss]
         elif dfjspt_params.use_custom_loss is False:
             return policy_loss
         else:
             raise RuntimeError('Invalid "use_custom_loss" value!')
+
 
 
 class MachineActionMaskModel(TorchModelV2, nn.Module):
@@ -194,17 +260,37 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
         # PD-MORL: 获取原始观测和偏好的维度
         self.obs_shape = orig_space["observation"].shape  # (MAX_MACHINES, n_features)
         self.preference_dim = orig_space["preference"].shape[0]  # reward_size
-        
+
+        # PD-MORL: 计算展平后的观测维度
+        self.obs_dim = 1
+        for dim in self.obs_shape:
+            self.obs_dim *= dim
+
+        hidden_dim = max(32, self.preference_dim * 16)
+        self.pref_film = nn.Sequential(
+            nn.Linear(self.preference_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, self.obs_dim * 2),
+        )
+
+        self.il_softmax_temperature_start = getattr(
+            dfjspt_params, "il_softmax_temperature_start", 1.0
+        )
+        self.il_softmax_temperature_end = getattr(
+            dfjspt_params, "il_softmax_temperature_end", 1.0
+        )
+        self.il_softmax_temperature_decay = getattr(
+            dfjspt_params, "il_softmax_temperature_decay", 1.0
+        )
+        self.il_temperature_updates = 0
+        self.last_qfilter_ratio = 1.0
+        self.last_teacher_policy_kl = 0.0
+
         # PD-MORL: 为 imitation learning 保存不含偏好的原始观测空间
         self.orig_obs_space_for_il = Dict({
             "observation": orig_space["observation"],
             "action_mask": orig_space["action_mask"]
         })
-        
-        # PD-MORL: 计算展平后的观测维度
-        self.obs_dim = 1
-        for dim in self.obs_shape:
-            self.obs_dim *= dim
         
         # PD-MORL: 创建组合空间（observation + preference）
         combined_dim = self.obs_dim + self.preference_dim
@@ -238,14 +324,17 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
         observation_flat = observation.reshape(batch_size, -1)
         
         # PD-MORL: 拼接观测和偏好
-        combined_input = torch.cat([observation_flat, preference], dim=1)
+        film_params = self.pref_film(preference)
+        gamma, beta = torch.chunk(film_params, 2, dim=-1)
+        gamma = torch.tanh(gamma)
+        obs_modulated = observation_flat * (1 + gamma) + beta
+
+        combined_input = torch.cat([obs_modulated, preference], dim=1)
 
         # Compute the unmasked logits.
         logits, _ = self.internal_model({"obs": combined_input})
 
-        # Convert action_mask into a [0.0 || -inf]-type mask.
-        inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
-        masked_logits = logits + inf_mask
+        masked_logits = logits.masked_fill(~action_mask.bool(), -1e9)
 
         # Return masked logits.
         return masked_logits, state
@@ -256,8 +345,8 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
     @override(ModelV2)
     def custom_loss(self, policy_loss, loss_inputs=None):
         if dfjspt_params.use_custom_loss is True:
-            # Get the next batch from our input files.
-            batch = generate_sample_batch(batch_type="machine")
+            # Sample a mixed batch from the replay pools.
+            batch = MACHINE_REPLAY.sample()
 
             # PD-MORL: 使用不含偏好的原始观测空间进行维度还原
             obs = restore_original_dimensions(
@@ -266,34 +355,71 @@ class MachineActionMaskModel(TorchModelV2, nn.Module):
                 tensorlib="torch",
             )
             
-            # PD-MORL: 为 imitation learning 添加虚拟偏好向量（全零）
-            batch_size = obs["observation"].shape[0]
-            dummy_preference = torch.ones(batch_size, self.preference_dim, device=policy_loss[0].device) * 0.5
-            obs["preference"] = dummy_preference
-            
+            # 使用轨迹自带的偏好向量，保证同一 traj_id 的偏好一致
+            pref_tensor = torch.from_numpy(batch["pref_vec"]).float().to(policy_loss[0].device)
+            obs["preference"] = pref_tensor
+
             logits, _ = self.forward({"obs": obs}, [], None)
-            action_mask = obs["action_mask"]
-            # Convert action_mask into a [0.0 || -inf]-type mask.
-            inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
-            logits = logits + inf_mask
+            action_mask = torch.from_numpy(batch["valid_mask"]).to(policy_loss[0].device)
+            logits = logits.masked_fill(~action_mask.bool(), -1e9)
 
-            # Compute the IL loss.
-            action_dist_1 = TorchCategorical(logits, self.model_config)
-
-            imitation_loss_1 = torch.mean(
-                -action_dist_1.logp(
-                    # torch.from_numpy(batch["actions"]).to(policy_loss[0].device)
-                    torch.from_numpy(batch["actions"]).to(policy_loss[0].device)
-                )
+            teacher_scores = torch.from_numpy(batch["teacher_scores"]).float().to(
+                policy_loss[0].device
             )
-            imitation_loss = imitation_loss_1
-            # self.imitation_loss_metric = imitation_loss.item()
-            # self.policy_loss_metric = np.mean([loss.item() for loss in policy_loss])
+            teacher_scores = teacher_scores.masked_fill(~action_mask.bool(), -1e9)
+            actions_demo = torch.from_numpy(batch["actions"]).long().to(policy_loss[0].device)
 
-            # Add the imitation loss to each already calculated policy loss term.
-            # Alternatively (if custom loss has its own optimizer):
-            # return policy_loss + [10 * self.imitation_loss]
-            return [loss_ + dfjspt_params.il_loss_weight * imitation_loss for loss_ in policy_loss]
+            temperature = max(
+                self.il_softmax_temperature_end,
+                self.il_softmax_temperature_start
+                * (self.il_softmax_temperature_decay ** self.il_temperature_updates),
+            )
+            self.il_temperature_updates += 1
+            teacher_probs = torch.softmax(teacher_scores / temperature, dim=1)
+
+            log_probs = torch.log_softmax(logits, dim=1)
+            il_loss_soft = -(teacher_probs * log_probs).sum(dim=1)
+
+            pi = torch.distributions.Categorical(logits=logits)
+            scores_valid = torch.where(action_mask.bool(), teacher_scores, torch.zeros_like(teacher_scores))
+            with torch.no_grad():
+                pi_probs = pi.probs
+                v_s = (pi_probs * scores_valid).sum(dim=1)
+                q_sa_demo = scores_valid.gather(1, actions_demo.unsqueeze(-1)).squeeze(-1)
+                q_sa_pi = (pi_probs * scores_valid).sum(dim=1)
+                advantages = q_sa_demo - v_s
+                weights = torch.exp(
+                    torch.clamp(
+                        advantages
+                        / getattr(dfjspt_params, "il_awac_beta", 1.0),
+                        min=-getattr(dfjspt_params, "il_awac_clip", 5.0),
+                        max=getattr(dfjspt_params, "il_awac_clip", 5.0),
+                    )
+                )
+                good_mask = (
+                    q_sa_demo
+                    >= q_sa_pi + getattr(dfjspt_params, "il_qfilter_delta", 0.0)
+                ).float()
+
+            il_loss_aw = -(weights * pi.log_prob(actions_demo))
+            combined_il = (
+                getattr(dfjspt_params, "il_alpha_soft", 1.0) * il_loss_soft
+                + getattr(dfjspt_params, "il_alpha_aw", 1.0) * il_loss_aw
+            )
+
+            if getattr(dfjspt_params, "il_use_qfilter", True):
+                combined_il = combined_il * good_mask
+
+            il_loss = combined_il.mean()
+
+            teacher_policy_kl = (teacher_probs * (torch.log(teacher_probs + 1e-8) - log_probs)).sum(dim=1)
+            self.last_teacher_policy_kl = teacher_policy_kl.detach().mean().item()
+            self.last_qfilter_ratio = (
+                good_mask.mean().item() if getattr(dfjspt_params, "il_use_qfilter", True) else 1.0
+            )
+            adapt_lambda = dfjspt_params.il_loss_weight / (1.0 + teacher_policy_kl.detach().mean())
+
+            return [loss_ + adapt_lambda * il_loss for loss_ in policy_loss]
         else:
             return policy_loss
 
@@ -330,18 +456,38 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
         # PD-MORL: 获取原始观测和偏好的维度
         self.obs_shape = orig_space["observation"].shape  # (MAX_TRANSBOTS, n_features)
         self.preference_dim = orig_space["preference"].shape[0]  # reward_size
-        
+
+        # PD-MORL: 计算展平后的观测维度
+        self.obs_dim = 1
+        for dim in self.obs_shape:
+            self.obs_dim *= dim
+
+        hidden_dim = max(32, self.preference_dim * 16)
+        self.pref_film = nn.Sequential(
+            nn.Linear(self.preference_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, self.obs_dim * 2),
+        )
+
+        self.il_softmax_temperature_start = getattr(
+            dfjspt_params, "il_softmax_temperature_start", 1.0
+        )
+        self.il_softmax_temperature_end = getattr(
+            dfjspt_params, "il_softmax_temperature_end", 1.0
+        )
+        self.il_softmax_temperature_decay = getattr(
+            dfjspt_params, "il_softmax_temperature_decay", 1.0
+        )
+        self.il_temperature_updates = 0
+        self.last_qfilter_ratio = 1.0
+        self.last_teacher_policy_kl = 0.0
+
         # PD-MORL: 为 imitation learning 保存不含偏好的原始观测空间
         self.orig_obs_space_for_il = Dict({
             "observation": orig_space["observation"],
             "action_mask": orig_space["action_mask"]
         })
-        
-        # PD-MORL: 计算展平后的观测维度
-        self.obs_dim = 1
-        for dim in self.obs_shape:
-            self.obs_dim *= dim
-        
+
         # PD-MORL: 创建组合空间（observation + preference）
         combined_dim = self.obs_dim + self.preference_dim
         
@@ -374,14 +520,17 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
         observation_flat = observation.reshape(batch_size, -1)
         
         # PD-MORL: 拼接观测和偏好
-        combined_input = torch.cat([observation_flat, preference], dim=1)
+        film_params = self.pref_film(preference)
+        gamma, beta = torch.chunk(film_params, 2, dim=-1)
+        gamma = torch.tanh(gamma)
+        obs_modulated = observation_flat * (1 + gamma) + beta
+
+        combined_input = torch.cat([obs_modulated, preference], dim=1)
 
         # Compute the unmasked logits.
         logits, _ = self.internal_model({"obs": combined_input})
 
-        # Convert action_mask into a [0.0 || -inf]-type mask.
-        inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
-        masked_logits = logits + inf_mask
+        masked_logits = logits.masked_fill(~action_mask.bool(), -1e9)
 
         # Return masked logits.
         return masked_logits, state
@@ -393,8 +542,8 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
     @override(ModelV2)
     def custom_loss(self, policy_loss, loss_inputs=None):
         if dfjspt_params.use_custom_loss is True:
-            # Get the next batch from our input files.
-            batch = generate_sample_batch(batch_type="transbot")
+            # Sample a mixed batch from the replay pools.
+            batch = TRANSBOT_REPLAY.sample()
 
             # PD-MORL: 使用不含偏好的原始观测空间进行维度还原
             obs = restore_original_dimensions(
@@ -403,33 +552,71 @@ class TransbotActionMaskModel(TorchModelV2, nn.Module):
                 tensorlib="torch",
             )
             
-            # PD-MORL: 为 imitation learning 添加虚拟偏好向量（全零）
-            batch_size = obs["observation"].shape[0]
-            dummy_preference = torch.ones(batch_size, self.preference_dim, device=policy_loss[0].device) * 0.5
-            obs["preference"] = dummy_preference
-            
+            # 使用轨迹自带的偏好向量，保证同一 traj_id 的偏好一致
+            pref_tensor = torch.from_numpy(batch["pref_vec"]).float().to(policy_loss[0].device)
+            obs["preference"] = pref_tensor
+
             logits, _ = self.forward({"obs": obs}, [], None)
-            action_mask = obs["action_mask"]
-            # Convert action_mask into a [0.0 || -inf]-type mask.
-            inf_mask = torch.clamp(torch.log(action_mask), min=FLOAT_MIN)
-            logits = logits + inf_mask
+            action_mask = torch.from_numpy(batch["valid_mask"]).to(policy_loss[0].device)
+            logits = logits.masked_fill(~action_mask.bool(), -1e9)
 
-            # Compute the IL loss.
-            action_dist = TorchCategorical(logits, self.model_config)
-
-            imitation_loss = torch.mean(
-                -action_dist.logp(
-                    # torch.from_numpy(batch["actions"]).to(policy_loss[0].device)
-                    torch.from_numpy(batch["actions"]).to(policy_loss[0].device)
-                )
+            teacher_scores = torch.from_numpy(batch["teacher_scores"]).float().to(
+                policy_loss[0].device
             )
-            # self.imitation_loss_metric = imitation_loss.item()
-            # self.policy_loss_metric = np.mean([loss.item() for loss in policy_loss])
+            teacher_scores = teacher_scores.masked_fill(~action_mask.bool(), -1e9)
+            actions_demo = torch.from_numpy(batch["actions"]).long().to(policy_loss[0].device)
 
-            # Add the imitation loss to each already calculated policy loss term.
-            # Alternatively (if custom loss has its own optimizer):
-            # return policy_loss + [10 * self.imitation_loss]
-            return [loss_ + dfjspt_params.il_loss_weight * imitation_loss for loss_ in policy_loss]
+            temperature = max(
+                self.il_softmax_temperature_end,
+                self.il_softmax_temperature_start
+                * (self.il_softmax_temperature_decay ** self.il_temperature_updates),
+            )
+            self.il_temperature_updates += 1
+            teacher_probs = torch.softmax(teacher_scores / temperature, dim=1)
+
+            log_probs = torch.log_softmax(logits, dim=1)
+            il_loss_soft = -(teacher_probs * log_probs).sum(dim=1)
+
+            pi = torch.distributions.Categorical(logits=logits)
+            scores_valid = torch.where(action_mask.bool(), teacher_scores, torch.zeros_like(teacher_scores))
+            with torch.no_grad():
+                pi_probs = pi.probs
+                v_s = (pi_probs * scores_valid).sum(dim=1)
+                q_sa_demo = scores_valid.gather(1, actions_demo.unsqueeze(-1)).squeeze(-1)
+                q_sa_pi = (pi_probs * scores_valid).sum(dim=1)
+                advantages = q_sa_demo - v_s
+                weights = torch.exp(
+                    torch.clamp(
+                        advantages
+                        / getattr(dfjspt_params, "il_awac_beta", 1.0),
+                        min=-getattr(dfjspt_params, "il_awac_clip", 5.0),
+                        max=getattr(dfjspt_params, "il_awac_clip", 5.0),
+                    )
+                )
+                good_mask = (
+                    q_sa_demo
+                    >= q_sa_pi + getattr(dfjspt_params, "il_qfilter_delta", 0.0)
+                ).float()
+
+            il_loss_aw = -(weights * pi.log_prob(actions_demo))
+            combined_il = (
+                getattr(dfjspt_params, "il_alpha_soft", 1.0) * il_loss_soft
+                + getattr(dfjspt_params, "il_alpha_aw", 1.0) * il_loss_aw
+            )
+
+            if getattr(dfjspt_params, "il_use_qfilter", True):
+                combined_il = combined_il * good_mask
+
+            il_loss = combined_il.mean()
+
+            teacher_policy_kl = (teacher_probs * (torch.log(teacher_probs + 1e-8) - log_probs)).sum(dim=1)
+            self.last_teacher_policy_kl = teacher_policy_kl.detach().mean().item()
+            self.last_qfilter_ratio = (
+                good_mask.mean().item() if getattr(dfjspt_params, "il_use_qfilter", True) else 1.0
+            )
+            adapt_lambda = dfjspt_params.il_loss_weight / (1.0 + teacher_policy_kl.detach().mean())
+
+            return [loss_ + adapt_lambda * il_loss for loss_ in policy_loss]
         elif dfjspt_params.use_custom_loss is False:
             return policy_loss
         else:

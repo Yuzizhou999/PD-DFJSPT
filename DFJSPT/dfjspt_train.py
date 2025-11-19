@@ -1,10 +1,13 @@
+import copy
 import json
 import os
 import warnings
 import time
 import itertools
+import uuid
 import numpy as np
 import ray
+import torch
 from ray import air, tune, train
 from ray.rllib.algorithms import PPOConfig, PPO
 from ray.rllib.models import ModelCatalog
@@ -14,8 +17,10 @@ from ray.tune.logger import pretty_print
 from ray.rllib.algorithms.callbacks import DefaultCallbacks
 from ray.rllib.env import BaseEnv
 from ray.rllib.evaluation import Episode, RolloutWorker
+from ray.rllib.models.preprocessors import get_preprocessor
 from ray.rllib.policy import Policy
 from ray.rllib.policy.sample_batch import SampleBatch, concat_samples
+from ray.rllib.evaluation.sample_batch_builder import SampleBatchBuilder
 # from ray.rllib.algorithms.algorithm import Algorithm
 from typing import Dict
 # from gymnasium import spaces
@@ -30,7 +35,20 @@ from typing import Dict
 
 from DFJSPT import dfjspt_params
 from DFJSPT.dfjspt_env import DfjsptMaEnv
-from DFJSPT.dfjspt_agent_model import JobActionMaskModel, MachineActionMaskModel, TransbotActionMaskModel
+from DFJSPT.dfjspt_agent_model import (
+    JOB_REPLAY,
+    MACHINE_REPLAY,
+    TRANSBOT_REPLAY,
+    JobActionMaskModel,
+    MachineActionMaskModel,
+    TransbotActionMaskModel,
+)
+from DFJSPT.dfjspt_generate_a_sample_batch import _sample_pref_vec
+from DFJSPT.dfjspt_rule.job_selection_rules import job_FDD_MTWR_scores
+from DFJSPT.dfjspt_rule.machine_selection_rules import (
+    _machine_EET_scores,
+    _transbot_EET_scores,
+)
 
 # 原来就有的 base_log_dir
 base_log_dir = os.path.join(
@@ -372,15 +390,239 @@ class MyTrainable(tune.Trainable):
         self.agent1 = self.config.build()
 
         self.epoch = 0
+        self.dagger_env = DfjsptMaEnv({"train_or_eval_or_test": "train", "w_batch_set": generate_w_batch(2, 0.05)})
+        self.dagger_preprocessors = {
+            agent: get_preprocessor(self.dagger_env.observation_space[agent])(
+                self.dagger_env.observation_space[agent]
+            )
+            for agent in ["agent0", "agent1", "agent2"]
+        }
+        self.dagger_interval_multiplier = 1.0
+        self.dagger_latest_labels = {"total": 0, "job": 0, "machine": 0, "transbot": 0}
 
     def step(self):
+        actual_interval = max(1, int(dfjspt_params.dagger_label_interval * self.dagger_interval_multiplier))
+        if self.epoch % actual_interval == 0:
+            self.dagger_latest_labels = self._collect_dagger_data()
+        else:
+            self.dagger_latest_labels = {"total": 0, "job": 0, "machine": 0, "transbot": 0}
+
         result = self.agent1.train()
+        result["dagger_labels"] = self.dagger_latest_labels.get("total", 0)
+        result["dagger_labels_job"] = self.dagger_latest_labels.get("job", 0)
+        result["dagger_labels_machine"] = self.dagger_latest_labels.get("machine", 0)
+        result["dagger_labels_transbot"] = self.dagger_latest_labels.get("transbot", 0)
+        self._update_dagger_schedule()
         if result["custom_metrics"]["total_makespan_mean"] <= result["custom_metrics"]["instance_rule_makespan_mean"] - 100:
             dfjspt_params.use_custom_loss = False
         if result["episodes_total"] >= 2e5:
             dfjspt_params.use_custom_loss = False
         self.epoch += 1
         return result
+
+    def _policy_for_agent(self, agent_id: str) -> str:
+        if agent_id == "agent0":
+            return "policy_agent0"
+        if agent_id == "agent1":
+            return "policy_agent1"
+        return "policy_agent2"
+
+    def _mean_il_stat(self, attr: str) -> float | None:
+        values = []
+        for policy_id in ["policy_agent0", "policy_agent1", "policy_agent2"]:
+            model = getattr(self.agent1.get_policy(policy_id), "model", None)
+            if model is not None and hasattr(model, attr):
+                values.append(getattr(model, attr))
+        if not values:
+            return None
+        return float(np.mean(values))
+
+    def _should_cooldown_dagger(self) -> bool:
+        qfilter_ratio = self._mean_il_stat("last_qfilter_ratio")
+        kl_teacher_policy = self._mean_il_stat("last_teacher_policy_kl")
+        if qfilter_ratio is None or kl_teacher_policy is None:
+            return False
+        return (
+            qfilter_ratio < dfjspt_params.dagger_qfilter_cooldown
+            and kl_teacher_policy < dfjspt_params.dagger_kl_cooldown
+        )
+
+    def _update_replay_sampling(self, dagger_ratio: float):
+        dagger_ratio = float(np.clip(
+            dagger_ratio,
+            dfjspt_params.dagger_min_ratio,
+            dfjspt_params.dagger_max_ratio,
+        ))
+        base_other = dfjspt_params.dagger_online_ratio + dfjspt_params.dagger_demo_ratio
+        remaining = max(1e-6, 1.0 - dagger_ratio)
+        online_ratio = remaining * (dfjspt_params.dagger_online_ratio / base_other)
+        demo_ratio = remaining - online_ratio
+        ratios = {"online": online_ratio, "demo": demo_ratio, "dagger": dagger_ratio}
+        for buffer_ in (JOB_REPLAY, MACHINE_REPLAY, TRANSBOT_REPLAY):
+            buffer_.sample_ratios = ratios.copy()
+
+    def _update_dagger_schedule(self):
+        if self._should_cooldown_dagger():
+            self.dagger_interval_multiplier = min(
+                dfjspt_params.dagger_interval_multiplier_max,
+                self.dagger_interval_multiplier * dfjspt_params.dagger_interval_growth,
+            )
+            target_ratio = max(
+                dfjspt_params.dagger_min_ratio,
+                JOB_REPLAY.sample_ratios.get("dagger", dfjspt_params.dagger_base_ratio) * 0.8,
+            )
+        else:
+            self.dagger_interval_multiplier = max(
+                1.0,
+                self.dagger_interval_multiplier / dfjspt_params.dagger_interval_shrink,
+            )
+            target_ratio = dfjspt_params.dagger_base_ratio
+        self._update_replay_sampling(target_ratio)
+
+    def _should_label_state(self, logits, vf_pred, valid_mask, step_id: int) -> bool:
+        if logits is None:
+            return False
+        logit_tensor = torch.as_tensor(logits)
+        # ensure invalid actions stay suppressed when computing entropy
+        logit_tensor = logit_tensor.masked_fill(~torch.as_tensor(valid_mask).bool(), -1e9)
+        dist = torch.distributions.Categorical(logits=logit_tensor)
+        probs = dist.probs
+        topk = torch.topk(probs, k=min(2, probs.shape[-1]))
+        gap = (
+            (topk.values[0] - topk.values[1]).item()
+            if topk.values.numel() > 1
+            else topk.values[0].item()
+        )
+        entropy = dist.entropy().item()
+        interval_trigger = step_id % dfjspt_params.dagger_label_stride == 0
+        value_trigger = vf_pred is not None and float(vf_pred) < dfjspt_params.dagger_value_threshold
+        uncertainty_trigger = (
+            entropy > dfjspt_params.dagger_entropy_threshold
+            or gap < dfjspt_params.dagger_confidence_gap
+        )
+        return interval_trigger or value_trigger or uncertainty_trigger
+
+    def _compute_teacher_scores(self, agent_id: str, agent_obs, pref_vec: np.ndarray):
+        valid_mask = np.asarray(agent_obs.get("action_mask", []), dtype=np.bool_)
+        if valid_mask.sum() == 0:
+            return None
+        if agent_id == "agent0":
+            scores = job_FDD_MTWR_scores(
+                legal_job_actions=copy.deepcopy(agent_obs.get("action_mask", [])),
+                real_job_attrs=copy.deepcopy(agent_obs.get("observation", [])),
+            )
+        elif agent_id == "agent1":
+            scores = _machine_EET_scores(
+                legal_machine_actions=copy.deepcopy(agent_obs.get("action_mask", [])),
+                real_machine_attrs=copy.deepcopy(agent_obs.get("observation", [])),
+                pref_vec=pref_vec,
+            )
+        else:
+            scores = _transbot_EET_scores(
+                legal_transbot_actions=copy.deepcopy(agent_obs.get("action_mask", [])),
+                real_transbot_attrs=copy.deepcopy(agent_obs.get("observation", [])),
+                pref_vec=pref_vec,
+            )
+
+        scores = np.asarray(scores, dtype=np.float32)
+        scores[~valid_mask] = -np.inf
+        return scores
+
+    def _record_dagger_sample(
+        self,
+        agent_id: str,
+        agent_obs,
+        pref_vec: np.ndarray,
+        teacher_scores: np.ndarray,
+        traj_id: str,
+        step_id: int,
+        builders: Dict[str, SampleBatchBuilder],
+    ):
+        preprocessor = self.dagger_preprocessors[agent_id]
+        valid_mask = np.asarray(agent_obs["action_mask"], dtype=np.float32)
+        builders[agent_id].add_values(
+            obs_flat=preprocessor.transform(agent_obs),
+            actions=int(np.argmax(teacher_scores)),
+            valid_mask=valid_mask,
+            pref_vec=pref_vec.astype(np.float32),
+            teacher_scores=teacher_scores.astype(np.float32),
+            source="dagger",
+            traj_id=traj_id,
+            step_id=step_id,
+        )
+
+    def _collect_dagger_data(self) -> Dict[str, int]:
+        job_builder = SampleBatchBuilder()
+        machine_builder = SampleBatchBuilder()
+        transbot_builder = SampleBatchBuilder()
+        builders = {
+            "agent0": job_builder,
+            "agent1": machine_builder,
+            "agent2": transbot_builder,
+        }
+
+        observation, info = self.dagger_env.reset()
+        traj_pref = None
+        traj_id = str(uuid.uuid4())
+        labels_added = 0
+        step_id = 0
+
+        while labels_added < dfjspt_params.dagger_max_labels and step_id < dfjspt_params.dagger_rollout_horizon:
+            actions = {}
+            for agent_id, agent_obs in observation.items():
+                pref_vec = traj_pref
+                if pref_vec is None:
+                    pref_vec = np.asarray(agent_obs.get("preference", _sample_pref_vec()), dtype=np.float32)
+                    traj_pref = pref_vec
+
+                policy_id = self._policy_for_agent(agent_id)
+                action, _, extra = self.agent1.get_policy(policy_id).compute_single_action(
+                    agent_obs, full_fetch=True, explore=True
+                )
+                logits = None
+                vf_pred = None
+                if isinstance(extra, dict):
+                    logits = extra.get("action_dist_inputs")
+                    vf_pred = extra.get("vf_preds")
+                valid_mask = np.asarray(agent_obs.get("action_mask", []), dtype=np.float32)
+                if self._should_label_state(logits, vf_pred, valid_mask, step_id):
+                    teacher_scores = self._compute_teacher_scores(agent_id, agent_obs, pref_vec)
+                    if teacher_scores is not None:
+                        self._record_dagger_sample(
+                            agent_id,
+                            agent_obs,
+                            pref_vec,
+                            teacher_scores,
+                            traj_id,
+                            step_id,
+                            builders,
+                        )
+                        labels_added += 1
+
+                actions[agent_id] = action
+
+            observation, reward, terminated, truncated, info = self.dagger_env.step(actions)
+            step_id += 1
+            if terminated.get("__all__") or truncated.get("__all__"):
+                break
+
+        job_labels = job_builder.count
+        machine_labels = machine_builder.count
+        transbot_labels = transbot_builder.count
+
+        if job_labels > 0:
+            JOB_REPLAY.add_batch(job_builder.build_and_reset())
+        if machine_labels > 0:
+            MACHINE_REPLAY.add_batch(machine_builder.build_and_reset())
+        if transbot_labels > 0:
+            TRANSBOT_REPLAY.add_batch(transbot_builder.build_and_reset())
+
+        return {
+            "total": job_labels + machine_labels + transbot_labels,
+            "job": job_labels,
+            "machine": machine_labels,
+            "transbot": transbot_labels,
+        }
 
     def save_checkpoint(self, tmp_checkpoint_dir):
         self.agent1.save(tmp_checkpoint_dir)
